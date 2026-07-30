@@ -68,11 +68,14 @@ RUN git clone https://github.com/ostris/ai-toolkit.git $AITK_DIR/repo && \
     latest_tag=$(git tag -l 'v[0-9]*' | sort -V | tail -n 1) && \
     if [ -n "$latest_tag" ]; then echo "Build-time checking out stable AI-Toolkit tag: $latest_tag" && git checkout -f "$latest_tag"; fi
 
-RUN python -m venv $AITK_DIR/venv && \
+# Ensure python symlink exists for python3
+RUN ln -sf $(which python3) /usr/local/bin/python || true
+
+RUN python3 -m venv $AITK_DIR/venv && \
     $AITK_DIR/venv/bin/python -m pip install --upgrade pip wheel setuptools
 
 # Link system torch/cuda packages into AI-Toolkit venv to avoid downloading torch again
-RUN python -c 'import site, glob, os; sys_site = site.getsitepackages()[0]; venv_site = "/opt/ai-toolkit/venv/lib/python3.12/site-packages"; [os.symlink(os.path.join(sys_site, p), os.path.join(venv_site, p)) for p in os.listdir(sys_site) if p.startswith(("torch", "caffe2", "nvidia")) and not os.path.exists(os.path.join(venv_site, p))]' || true
+RUN python3 -c 'import site, glob, os; sys_site = site.getsitepackages()[0]; venv_site = "/opt/ai-toolkit/venv/lib/python3.12/site-packages"; [os.symlink(os.path.join(sys_site, p), os.path.join(venv_site, p)) for p in os.listdir(sys_site) if p.startswith(("torch", "caffe2", "nvidia")) and not os.path.exists(os.path.join(venv_site, p))]' || true
 
 # Install AI-Toolkit requirements excluding torch binaries
 RUN set -e; \
@@ -140,7 +143,7 @@ done
 # Keep a constraints file with the image's known-good runtime foundation so
 # node installs cannot silently replace CUDA/Torch-adjacent wheels later.
 RUN mkdir -p /etc/pip && \
-    python - <<'PY' > /etc/pip/constraints.txt
+    python3 - <<'PY' > /etc/pip/constraints.txt
 from importlib import metadata
 
 locked = [
@@ -169,7 +172,7 @@ RUN set -e; \
   fi; \
   if [ -n "$manager_cli" ]; then \
     echo "[manager] prefetching snapshot list via $manager_cli"; \
-    (cd /Comfy && python "$manager_cli" show snapshot-list --mode remote) || \
+    (cd /Comfy && python3 "$manager_cli" show snapshot-list --mode remote) || \
       echo "[manager][warn] snapshot-list prefetch failed; continuing build."; \
   else \
     echo "ComfyUI-Manager cm-cli not available at build time; skipping snapshot-list prefetch."; \
