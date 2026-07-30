@@ -8,8 +8,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     SHELL=/bin/bash
 
-# Install system dependencies (extra utilities)
+# Install system dependencies (extra EGL/OpenGL libraries & utilities missing in base image)
 RUN apt update && apt install -y --no-install-recommends \
+    libglu1-mesa \
+    libopengl0 \
+    libegl1-mesa \
+    libgles2-mesa \
+    libnvidia-egl-wayland1 \
     dos2unix \
     ncdu \
     nginx \
@@ -77,7 +82,7 @@ RUN python3 -m venv $AITK_DIR/venv && \
 # Link system torch/cuda packages into AI-Toolkit venv to avoid downloading torch again
 RUN python3 -c 'import site, glob, os; sys_site = site.getsitepackages()[0]; venv_site = "/opt/ai-toolkit/venv/lib/python3.12/site-packages"; [os.symlink(os.path.join(sys_site, p), os.path.join(venv_site, p)) for p in os.listdir(sys_site) if p.startswith(("torch", "caffe2", "nvidia")) and not os.path.exists(os.path.join(venv_site, p))]' || true
 
-# Install AI-Toolkit requirements excluding torch binaries
+# Install AI-Toolkit requirements excluding torch binaries, ensuring torchsde & trampoline are installed
 RUN set -e; \
     tmp_req="$AITK_DIR/requirements.no-torch.txt"; \
     if [ -f $AITK_DIR/repo/requirements_base.txt ]; then \
@@ -85,7 +90,7 @@ RUN set -e; \
     else \
       grep -Ev '^(torch|torchvision|torchaudio)($|[<>=])' $AITK_DIR/repo/requirements.txt > "$tmp_req"; \
     fi; \
-    $AITK_DIR/venv/bin/python -m pip install -r "$tmp_req" scipy==1.12.0 || true; \
+    $AITK_DIR/venv/bin/python -m pip install -r "$tmp_req" scipy==1.12.0 torchsde trampoline || true; \
     touch $AITK_DIR/.deps_installed
 
 RUN if [ -f $AITK_DIR/repo/ui/package.json ]; then \

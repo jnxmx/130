@@ -785,8 +785,10 @@ prepare_ai_toolkit_runtime() {
       grep -Ev '^(torch|torchvision|torchaudio)($|[<>=])' "$AITK_REPO_DIR/requirements.txt" > "$tmp_req" || cp "$AITK_REPO_DIR/requirements.txt" "$tmp_req"
       if [[ -f "$pip_constraint" ]]; then
         PIP_CONSTRAINT="$pip_constraint" pip_install_requirements "$AITK_VENV/bin/python" "$tmp_req" >> /ai_toolkit_setup.log 2>&1 || true
+        PIP_CONSTRAINT="$pip_constraint" pip_install "$AITK_VENV/bin/python" torchsde trampoline >> /ai_toolkit_setup.log 2>&1 || true
       else
         pip_install_requirements "$AITK_VENV/bin/python" "$tmp_req" >> /ai_toolkit_setup.log 2>&1 || true
+        pip_install "$AITK_VENV/bin/python" torchsde trampoline >> /ai_toolkit_setup.log 2>&1 || true
       fi
     fi
 
