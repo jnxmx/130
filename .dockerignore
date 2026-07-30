@@ -1,0 +1,35 @@
+# Keep Docker build context minimal.
+*
+
+# Explicit local-only exclusions (for readability).
+external_audit/
+abandoned_branch/
+.git/
+.vscode/
+.codex_tmp/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+tmp/
+temp/
+*.tmp
+*.log
+
+# Include only files needed by dockerfile.
+!.dockerignore
+!dockerfile
+!Dockerfile
+!start.sh
+!README.md
+!502.html
+!nginx.conf
+!config.ini
+!comfy.settings.json
+!assets/
+!assets/**
+!scripts/
+!scripts/**
+!wheels/
+!wheels/**
