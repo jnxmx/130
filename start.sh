@@ -719,10 +719,21 @@ prepare_ai_toolkit_runtime() {
 
   if [[ ! -d "$AITK_REPO_DIR/.git" ]]; then
     echo "[ai-toolkit] cloning repo." >> /ai_toolkit_setup.log
-    git clone --depth 1 "$AITK_REPO_URL" "$AITK_REPO_DIR" >> /ai_toolkit_setup.log 2>&1 || true
+    git clone "$AITK_REPO_URL" "$AITK_REPO_DIR" >> /ai_toolkit_setup.log 2>&1 || true
+    latest_tag=$(git -C "$AITK_REPO_DIR" tag -l 'v[0-9]*' | sort -V | tail -n 1)
+    if [[ -n "$latest_tag" ]]; then
+      echo "[ai-toolkit] checking out stable tag: $latest_tag" >> /ai_toolkit_setup.log
+      git -C "$AITK_REPO_DIR" checkout -f "$latest_tag" >> /ai_toolkit_setup.log 2>&1 || true
+    fi
   elif [[ "${AITK_UPDATE:-0}" == "1" ]]; then
-    echo "[ai-toolkit] updating repo." >> /ai_toolkit_setup.log
-    git -C "$AITK_REPO_DIR" pull --ff-only >> /ai_toolkit_setup.log 2>&1 || true
+    echo "[ai-toolkit] updating repo to latest stable tag." >> /ai_toolkit_setup.log
+    git -C "$AITK_REPO_DIR" fetch --tags >> /ai_toolkit_setup.log 2>&1 || true
+    latest_tag=$(git -C "$AITK_REPO_DIR" tag -l 'v[0-9]*' | sort -V | tail -n 1)
+    if [[ -n "$latest_tag" ]]; then
+      git -C "$AITK_REPO_DIR" checkout -f "$latest_tag" >> /ai_toolkit_setup.log 2>&1 || true
+    else
+      git -C "$AITK_REPO_DIR" pull --ff-only >> /ai_toolkit_setup.log 2>&1 || true
+    fi
   fi
 
   prepare_ai_toolkit_data_dirs

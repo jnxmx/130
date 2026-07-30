@@ -1,7 +1,6 @@
 FROM runpod/comfyui:cuda13.0
 
 ARG CUDA="130"
-ARG PYTHON_VERSION=3.12
 ARG PYTORCH=2.13.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -9,28 +8,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     SHELL=/bin/bash
 
-# Install system dependencies
+# Install system dependencies (extra utilities)
 RUN apt update && apt install -y --no-install-recommends \
-    build-essential \
-    software-properties-common \
-    bash \
     dos2unix \
-    git \
-    git-lfs \
     ncdu \
     nginx \
-    net-tools \
-    dnsutils \
-    inetutils-ping \
-    openssh-server \
-    libglib2.0-0 \
-    libsm6 \
-    libgl1 \
-    libxrender1 \
-    libxext6 \
-    ffmpeg \
-    wget \
-    curl \
     psmisc \
     rsync \
     vim \
@@ -44,8 +26,6 @@ RUN apt update && apt install -y --no-install-recommends \
     bc \
     aria2 \
     cron \
-    pkg-config \
-    plocate \
     parallel \
     pv \
     sysstat \
@@ -55,39 +35,20 @@ RUN apt update && apt install -y --no-install-recommends \
     cpio \
     jq \
     mc \
-    libcairo2-dev \
     libgoogle-perftools4 \
     libtcmalloc-minimal4 \
-    apt-transport-https \
-    ca-certificates \
-    libegl1 \
-    portaudio19-dev \
-    python3-opencv \
     nvtop \
-    cmake \
  && rm -rf /var/lib/apt/lists/*
 
- # Install Node.js v23.x from nodesource
+# Install Node.js v23.x from nodesource
 RUN curl -fsSL https://deb.nodesource.com/setup_23.x | bash - \
     && apt-get update \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# --- Python 3.12 (deadsnakes) + pip ---
-RUN add-apt-repository -y ppa:deadsnakes/ppa \
- && apt-get update && apt-get install -y --no-install-recommends \
-    python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv python3-tk \
- && rm -f /usr/bin/python /usr/bin/python3 \
- && ln -s /usr/bin/python${PYTHON_VERSION} /usr/bin/python \
- && ln -s /usr/bin/python${PYTHON_VERSION} /usr/bin/python3 \
- && curl -sS https://bootstrap.pypa.io/get-pip.py | python \
- && python -m pip install --upgrade --no-cache-dir pip
-
-# Install uv (faster installer)
-RUN pip install --no-cache-dir uv
-
-# Install JupyterLab and related tools
+# Install uv (faster installer) & JupyterLab
 RUN pip install --no-cache-dir \
+    uv \
     jupyterlab \
     jupyterlab_widgets \
     ipykernel \
@@ -97,30 +58,33 @@ RUN pip install --no-cache-dir \
 # Install FileBrowser
 RUN curl -fsSL https://raw.githubusercontent.com/filebrowser/get/master/get.sh | bash
 
-# torch
-RUN pip install --no-cache-dir \
-    torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
-
-# --- AI Toolkit (code + isolated venv in image) ---
+# --- AI Toolkit (code + isolated venv, linked to system torch) ---
 ENV AITK_DIR=/opt/ai-toolkit
 RUN mkdir -p $AITK_DIR
 WORKDIR $AITK_DIR
-RUN git clone --depth 1 https://github.com/ostris/ai-toolkit.git $AITK_DIR/repo
+RUN git clone https://github.com/ostris/ai-toolkit.git $AITK_DIR/repo && \
+    cd $AITK_DIR/repo && \
+    git fetch --tags && \
+    latest_tag=$(git tag -l 'v[0-9]*' | sort -V | tail -n 1) && \
+    if [ -n "$latest_tag" ]; then echo "Build-time checking out stable AI-Toolkit tag: $latest_tag" && git checkout -f "$latest_tag"; fi
+
 RUN python -m venv $AITK_DIR/venv && \
     $AITK_DIR/venv/bin/python -m pip install --upgrade pip wheel setuptools
+
+# Link system torch/cuda packages into AI-Toolkit venv to avoid downloading torch again
+RUN python -c 'import site, glob, os; sys_site = site.getsitepackages()[0]; venv_site = "/opt/ai-toolkit/venv/lib/python3.12/site-packages"; [os.symlink(os.path.join(sys_site, p), os.path.join(venv_site, p)) for p in os.listdir(sys_site) if p.startswith(("torch", "caffe2", "nvidia")) and not os.path.exists(os.path.join(venv_site, p))]' || true
+
+# Install AI-Toolkit requirements excluding torch binaries
 RUN set -e; \
-    sys_torch="$(python -c 'import torch; print(torch.__version__)' 2>/dev/null || true)"; \
-    sys_torchvision="$(python -c 'import torchvision; print(torchvision.__version__)' 2>/dev/null || true)"; \
-    sys_torchaudio="$(python -c 'import torchaudio; print(torchaudio.__version__)' 2>/dev/null || true)"; \
-    if [ -n "$sys_torch" ] && [ -n "$sys_torchvision" ] && [ -n "$sys_torchaudio" ]; then \
-      $AITK_DIR/venv/bin/python -m pip install --index-url https://download.pytorch.org/whl/cu130 \
-        "torch==$sys_torch" "torchvision==$sys_torchvision" "torchaudio==$sys_torchaudio"; \
+    tmp_req="$AITK_DIR/requirements.no-torch.txt"; \
+    if [ -f $AITK_DIR/repo/requirements_base.txt ]; then \
+      grep -Ev '^(torch|torchvision|torchaudio)($|[<>=])' $AITK_DIR/repo/requirements_base.txt > "$tmp_req"; \
     else \
-      $AITK_DIR/venv/bin/python -m pip install --index-url https://download.pytorch.org/whl/cu130 \
-        torch torchvision torchaudio; \
+      grep -Ev '^(torch|torchvision|torchaudio)($|[<>=])' $AITK_DIR/repo/requirements.txt > "$tmp_req"; \
     fi; \
-    $AITK_DIR/venv/bin/python -m pip install -r $AITK_DIR/repo/requirements.txt; \
+    $AITK_DIR/venv/bin/python -m pip install -r "$tmp_req" scipy==1.12.0 || true; \
     touch $AITK_DIR/.deps_installed
+
 RUN if [ -f $AITK_DIR/repo/ui/package.json ]; then \
       cd $AITK_DIR/repo/ui && npm install --include=dev && npm rebuild sqlite3 --build-from-source && npm run update_db && npm run build && \
       touch $AITK_DIR/.ui_built; \
