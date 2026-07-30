@@ -12,9 +12,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt update && apt install -y --no-install-recommends \
     libglu1-mesa \
     libopengl0 \
-    libegl1-mesa \
-    libgles2-mesa \
-    libnvidia-egl-wayland1 \
+    libegl1 \
+    libgles2 \
+    libegl-mesa0 \
     dos2unix \
     ncdu \
     nginx \
