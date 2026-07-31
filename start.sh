@@ -1240,28 +1240,34 @@ if [[ "${MAKE_WHEELS:-0}" == "1" ]]; then
     echo "[WARN] No supported GPU architecture detected; skipping sageattention wheel build."
   else
     mkdir -p "$SAGE_WHEEL_OUTPUT_DIR"
-    TMP_SAGE_DIR=$(mktemp -d /tmp/sageattention-build.XXXXXX)
-    echo "Building sageattention wheel from git repository into $TMP_SAGE_DIR"
-    if pip wheel --no-deps --no-build-isolation --no-cache-dir "git+https://github.com/sageattention/SageAttention.git" -w "$TMP_SAGE_DIR"; then
-      BUILT_WHEEL=$(find "$TMP_SAGE_DIR" -maxdepth 1 -type f -name "sageattention-*.whl" -print -quit)
-      if [[ -n "$BUILT_WHEEL" ]]; then
-        BASE_NAME=$(basename "$BUILT_WHEEL")
-        VER_STR=$(echo "$BASE_NAME" | sed -E 's/sageattention-([0-9\.]+)-.*/\1/')
-        RENAMED_NAME="${BASE_NAME/sageattention-${VER_STR}-/sageattention-${VER_STR}+${ARCH}-}"
-        TARGET_PATH="${SAGE_WHEEL_OUTPUT_DIR}/${RENAMED_NAME}"
-        mv "$BUILT_WHEEL" "$TARGET_PATH"
-        echo "Saved architecture-specific wheel to $TARGET_PATH"
-        echo "Installing sageattention from built wheel"
-        pip_install "$VIRTUAL_ENV/bin/python" --no-deps "$TARGET_PATH"
+    TMP_SAGE_BUILD_DIR=$(mktemp -d /tmp/sageattention-src.XXXXXX)
+    TMP_SAGE_WHEEL_DIR=$(mktemp -d /tmp/sageattention-out.XXXXXX)
+    echo "Cloning SageAttention repository into $TMP_SAGE_BUILD_DIR"
+    if GIT_TERMINAL_PROMPT=0 git clone --depth 1 https://github.com/sageattention/SageAttention.git "$TMP_SAGE_BUILD_DIR"; then
+      echo "Building sageattention wheel in $TMP_SAGE_WHEEL_DIR"
+      if (cd "$TMP_SAGE_BUILD_DIR" && pip wheel --no-deps --no-build-isolation --no-cache-dir . -w "$TMP_SAGE_WHEEL_DIR"); then
+        BUILT_WHEEL=$(find "$TMP_SAGE_WHEEL_DIR" -maxdepth 1 -type f -name "sageattention-*.whl" -print -quit)
+        if [[ -n "$BUILT_WHEEL" ]]; then
+          BASE_NAME=$(basename "$BUILT_WHEEL")
+          VER_STR=$(echo "$BASE_NAME" | sed -E 's/sageattention-([0-9\.]+)-.*/\1/')
+          RENAMED_NAME="${BASE_NAME/sageattention-${VER_STR}-/sageattention-${VER_STR}+${ARCH}-}"
+          TARGET_PATH="${SAGE_WHEEL_OUTPUT_DIR}/${RENAMED_NAME}"
+          mv "$BUILT_WHEEL" "$TARGET_PATH"
+          echo "Saved architecture-specific wheel to $TARGET_PATH"
+          echo "Installing sageattention from built wheel"
+          pip_install "$VIRTUAL_ENV/bin/python" --no-deps "$TARGET_PATH"
+        else
+          echo "[WARN] Wheel build succeeded but artifact missing; installing from source directly"
+          pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_SAGE_BUILD_DIR"
+        fi
       else
-        echo "[WARN] Wheel build succeeded but artifact missing; installing from git directly"
-        pip_install "$VIRTUAL_ENV/bin/python" "git+https://github.com/sageattention/SageAttention.git"
+        echo "[WARN] Failed to build sageattention wheel; installing from source directly"
+        pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_SAGE_BUILD_DIR"
       fi
     else
-      echo "[WARN] Failed to build sageattention wheel; installing from git directly"
-      pip_install "$VIRTUAL_ENV/bin/python" "git+https://github.com/sageattention/SageAttention.git"
+      echo "[WARN] Failed to clone SageAttention git repository"
     fi
-    rm -rf "${TMP_SAGE_DIR:-}"
+    rm -rf "${TMP_SAGE_BUILD_DIR:-}" "${TMP_SAGE_WHEEL_DIR:-}"
   fi
 else
   if [ "$ARCH" != "none" ]; then
@@ -1271,13 +1277,21 @@ else
           echo "Installing sageattention wheel for architecture $ARCH"
           pip_install "$VIRTUAL_ENV/bin/python" --no-deps "$WHEEL_FILE"
       else
-          echo "No matching wheel found for architecture $ARCH, installing from git"
-          pip_install "$VIRTUAL_ENV/bin/python" "git+https://github.com/sageattention/SageAttention.git"
+          echo "No matching wheel found for architecture $ARCH, cloning and installing from source"
+          TMP_CLONE_DIR=$(mktemp -d /tmp/sage-clone.XXXXXX)
+          if GIT_TERMINAL_PROMPT=0 git clone --depth 1 https://github.com/sageattention/SageAttention.git "$TMP_CLONE_DIR"; then
+            pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_CLONE_DIR"
+          fi
+          rm -rf "$TMP_CLONE_DIR"
       fi
   else
       echo "STAGE: Installing sageattention"
       echo "Installing sageattention from git"
-      pip_install "$VIRTUAL_ENV/bin/python" "git+https://github.com/sageattention/SageAttention.git"
+      TMP_CLONE_DIR=$(mktemp -d /tmp/sage-clone.XXXXXX)
+      if GIT_TERMINAL_PROMPT=0 git clone --depth 1 https://github.com/sageattention/SageAttention.git "$TMP_CLONE_DIR"; then
+        pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_CLONE_DIR"
+      fi
+      rm -rf "$TMP_CLONE_DIR"
   fi
 fi
 
