@@ -1284,8 +1284,20 @@ if [[ "${MAKE_WHEELS:-0}" == "1" ]]; then
     TMP_SAGE_BUILD_DIR=$(mktemp -d /tmp/sageattention-src.XXXXXX)
     TMP_SAGE_WHEEL_DIR=$(mktemp -d /tmp/sageattention-out.XXXXXX)
     if _sage_fetch_source "$TMP_SAGE_BUILD_DIR"; then
-      echo "Building sageattention wheel in $TMP_SAGE_WHEEL_DIR"
-      if (cd "$TMP_SAGE_BUILD_DIR" && pip wheel --no-deps --no-build-isolation --no-cache-dir . -w "$TMP_SAGE_WHEEL_DIR"); then
+      echo "Building sageattention wheel for $ARCH in $TMP_SAGE_WHEEL_DIR..."
+      # Set target CUDA arch list to avoid building redundant kernels and reduce memory pressure
+      local CUDA_ARCH_VER=""
+      case "$ARCH" in
+        sm120) CUDA_ARCH_VER="12.0" ;;
+        sm89)  CUDA_ARCH_VER="8.9" ;;
+        sm86)  CUDA_ARCH_VER="8.6" ;;
+        *)     CUDA_ARCH_VER="" ;;
+      esac
+
+      if (cd "$TMP_SAGE_BUILD_DIR" && \
+          MAX_JOBS=4 \
+          ${CUDA_ARCH_VER:+TORCH_CUDA_ARCH_LIST="$CUDA_ARCH_VER"} \
+          pip wheel --no-deps --no-build-isolation --no-cache-dir . -w "$TMP_SAGE_WHEEL_DIR"); then
         BUILT_WHEEL=$(find "$TMP_SAGE_WHEEL_DIR" -maxdepth 1 -type f -name "sageattention-*.whl" -print -quit)
         if [[ -n "$BUILT_WHEEL" ]]; then
           BASE_NAME=$(basename "$BUILT_WHEEL")
@@ -1298,11 +1310,11 @@ if [[ "${MAKE_WHEELS:-0}" == "1" ]]; then
           pip_install "$VIRTUAL_ENV/bin/python" --no-deps "$TARGET_PATH"
         else
           echo "[WARN] Wheel build succeeded but artifact missing; installing from source directly"
-          pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_SAGE_BUILD_DIR"
+          MAX_JOBS=4 ${CUDA_ARCH_VER:+TORCH_CUDA_ARCH_LIST="$CUDA_ARCH_VER"} pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_SAGE_BUILD_DIR"
         fi
       else
         echo "[WARN] Failed to build sageattention wheel; installing from source directly"
-        pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_SAGE_BUILD_DIR"
+        MAX_JOBS=4 ${CUDA_ARCH_VER:+TORCH_CUDA_ARCH_LIST="$CUDA_ARCH_VER"} pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_SAGE_BUILD_DIR"
       fi
     else
       echo "[WARN] Failed to download SageAttention source archive"
@@ -1320,7 +1332,14 @@ else
           echo "No matching wheel found for architecture $ARCH, downloading and installing from source"
           TMP_CLONE_DIR=$(mktemp -d /tmp/sage-dl.XXXXXX)
           if _sage_fetch_source "$TMP_CLONE_DIR"; then
-            pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_CLONE_DIR"
+            local CUDA_ARCH_VER=""
+            case "$ARCH" in
+              sm120) CUDA_ARCH_VER="12.0" ;;
+              sm89)  CUDA_ARCH_VER="8.9" ;;
+              sm86)  CUDA_ARCH_VER="8.6" ;;
+              *)     CUDA_ARCH_VER="" ;;
+            esac
+            MAX_JOBS=4 ${CUDA_ARCH_VER:+TORCH_CUDA_ARCH_LIST="$CUDA_ARCH_VER"} pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_CLONE_DIR"
           fi
           rm -rf "$TMP_CLONE_DIR"
       fi
@@ -1329,7 +1348,7 @@ else
       echo "Installing sageattention from source tarball"
       TMP_CLONE_DIR=$(mktemp -d /tmp/sage-dl.XXXXXX)
       if _sage_fetch_source "$TMP_CLONE_DIR"; then
-        pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_CLONE_DIR"
+        MAX_JOBS=4 pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_CLONE_DIR"
       fi
       rm -rf "$TMP_CLONE_DIR"
   fi
