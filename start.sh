@@ -1241,42 +1241,43 @@ if [[ "${MAKE_WHEELS:-0}" == "1" ]]; then
   else
     mkdir -p "$SAGE_WHEEL_OUTPUT_DIR"
     TMP_SAGE_DIR=$(mktemp -d /tmp/sageattention-build.XXXXXX)
-    echo "Building sageattention==${SAGEATTENTION_VERSION} wheel into $TMP_SAGE_DIR"
-    if pip wheel --no-deps --no-build-isolation --no-cache-dir "sageattention==${SAGEATTENTION_VERSION}" -w "$TMP_SAGE_DIR"; then
-      BUILT_WHEEL=$(find "$TMP_SAGE_DIR" -maxdepth 1 -type f -name "sageattention-${SAGEATTENTION_VERSION}-*.whl" -print -quit)
+    echo "Building sageattention wheel from git repository into $TMP_SAGE_DIR"
+    if pip wheel --no-deps --no-build-isolation --no-cache-dir "git+https://github.com/sageattention/SageAttention.git" -w "$TMP_SAGE_DIR"; then
+      BUILT_WHEEL=$(find "$TMP_SAGE_DIR" -maxdepth 1 -type f -name "sageattention-*.whl" -print -quit)
       if [[ -n "$BUILT_WHEEL" ]]; then
         BASE_NAME=$(basename "$BUILT_WHEEL")
-        RENAMED_NAME="${BASE_NAME/sageattention-${SAGEATTENTION_VERSION}-/sageattention-${SAGEATTENTION_VERSION}+${ARCH}-}"
+        VER_STR=$(echo "$BASE_NAME" | sed -E 's/sageattention-([0-9\.]+)-.*/\1/')
+        RENAMED_NAME="${BASE_NAME/sageattention-${VER_STR}-/sageattention-${VER_STR}+${ARCH}-}"
         TARGET_PATH="${SAGE_WHEEL_OUTPUT_DIR}/${RENAMED_NAME}"
         mv "$BUILT_WHEEL" "$TARGET_PATH"
         echo "Saved architecture-specific wheel to $TARGET_PATH"
         echo "Installing sageattention from built wheel"
         pip_install "$VIRTUAL_ENV/bin/python" --no-deps "$TARGET_PATH"
       else
-        echo "[WARN] Wheel build succeeded but artifact missing; installing from pip instead"
-        pip_install "$VIRTUAL_ENV/bin/python" "sageattention==${SAGEATTENTION_VERSION}"
+        echo "[WARN] Wheel build succeeded but artifact missing; installing from git directly"
+        pip_install "$VIRTUAL_ENV/bin/python" "git+https://github.com/sageattention/SageAttention.git"
       fi
     else
-      echo "[WARN] Failed to build sageattention wheel; installing from pip instead"
-      pip_install "$VIRTUAL_ENV/bin/python" "sageattention==${SAGEATTENTION_VERSION}"
+      echo "[WARN] Failed to build sageattention wheel; installing from git directly"
+      pip_install "$VIRTUAL_ENV/bin/python" "git+https://github.com/sageattention/SageAttention.git"
     fi
     rm -rf "${TMP_SAGE_DIR:-}"
   fi
 else
   if [ "$ARCH" != "none" ]; then
       echo "STAGE: Installing sageattention"
-      WHEEL_FILE=$(find /wheels -type f -name "sageattention-*+${ARCH}-*.whl" 2>/dev/null | head -n 1)
+      WHEEL_FILE=$(find /wheels /workspace/wheels -type f -name "sageattention-*+${ARCH}-*.whl" 2>/dev/null | head -n 1)
       if [ -n "$WHEEL_FILE" ]; then
           echo "Installing sageattention wheel for architecture $ARCH"
           pip_install "$VIRTUAL_ENV/bin/python" --no-deps "$WHEEL_FILE"
       else
-          echo "No matching wheel found for architecture $ARCH, falling back to pip"
-          pip_install "$VIRTUAL_ENV/bin/python" sageattention==1.0.6
+          echo "No matching wheel found for architecture $ARCH, installing from git"
+          pip_install "$VIRTUAL_ENV/bin/python" "git+https://github.com/sageattention/SageAttention.git"
       fi
   else
       echo "STAGE: Installing sageattention"
-      echo "Installing sageattention from pip"
-      pip_install "$VIRTUAL_ENV/bin/python" sageattention==1.0.6
+      echo "Installing sageattention from git"
+      pip_install "$VIRTUAL_ENV/bin/python" "git+https://github.com/sageattention/SageAttention.git"
   fi
 fi
 
