@@ -192,8 +192,6 @@ RUN set -e; \
     #mv /Comfy/custom_nodes/comfyui-reactor-node /Comfy/custom_nodes/comfyui-reactor-node.disabled
 
 # Copy configuration and scripts
-WORKDIR /
-COPY README.md /usr/share/nginx/html/README.md
 COPY 502.html /usr/share/nginx/html/502.html
 COPY assets/ /usr/share/nginx/html/assets/
 COPY nginx.conf /etc/nginx/nginx.conf

@@ -1238,28 +1238,41 @@ EOF
 # Usage: _sage_fetch_source <dest_dir>
 _sage_fetch_source() {
   local DEST="$1"
+  echo "Fetching SageAttention source repository..."
+
+  # Method 1: Direct git clone
+  if GIT_TERMINAL_PROMPT=0 git clone --depth 1 https://github.com/sageattention/SageAttention.git "$DEST" 2>/dev/null; then
+    echo "Successfully cloned SageAttention via git"
+    return 0
+  fi
+
+  echo "[WARN] git clone failed, falling back to HTTPS archive download"
+
+  # Method 2: Codeload tarball download
   local TGZ
   TGZ=$(mktemp /tmp/sageattention-XXXXXX.tar.gz)
-  # Use codeload.github.com which serves raw tarballs without JS redirects
   local URL="https://codeload.github.com/sageattention/SageAttention/tar.gz/refs/heads/main"
-  echo "Fetching SageAttention from $URL"
-  if curl -fsSL --max-time 300 -o "$TGZ" "$URL"; then
-    # Verify it's actually a gzip file
-    if file "$TGZ" | grep -q 'gzip'; then
-      tar -xz -C "$DEST" --strip-components=1 -f "$TGZ"
-      local RET=$?
-      rm -f "$TGZ"
-      return $RET
-    else
-      echo "[WARN] Downloaded file is not a valid gzip archive (got: $(file "$TGZ"))"
-      rm -f "$TGZ"
-      return 1
-    fi
-  else
-    echo "[WARN] curl failed to download SageAttention tarball (exit $?)"
+  if curl -fsSL --max-time 300 -o "$TGZ" "$URL" && file "$TGZ" | grep -q 'gzip'; then
+    tar -xz -C "$DEST" --strip-components=1 -f "$TGZ"
     rm -f "$TGZ"
-    return 1
+    echo "Successfully downloaded SageAttention via codeload tarball"
+    return 0
   fi
+  rm -f "$TGZ"
+
+  # Method 3: GitHub archive tarball download
+  TGZ=$(mktemp /tmp/sageattention-XXXXXX.tar.gz)
+  URL="https://github.com/sageattention/SageAttention/archive/refs/heads/main.tar.gz"
+  if curl -fsSL --max-time 300 -L -o "$TGZ" "$URL" && file "$TGZ" | grep -q 'gzip'; then
+    tar -xz -C "$DEST" --strip-components=1 -f "$TGZ"
+    rm -f "$TGZ"
+    echo "Successfully downloaded SageAttention via github archive tarball"
+    return 0
+  fi
+  rm -f "$TGZ"
+
+  echo "[ERROR] All methods to download SageAttention source failed."
+  return 1
 }
 
 if [[ "${MAKE_WHEELS:-0}" == "1" ]]; then
