@@ -1234,6 +1234,34 @@ print(arch_map.get(cap, "none"))
 EOF
 )
 
+# Helper: download SageAttention source into a directory
+# Usage: _sage_fetch_source <dest_dir>
+_sage_fetch_source() {
+  local DEST="$1"
+  local TGZ
+  TGZ=$(mktemp /tmp/sageattention-XXXXXX.tar.gz)
+  # Use codeload.github.com which serves raw tarballs without JS redirects
+  local URL="https://codeload.github.com/sageattention/SageAttention/tar.gz/refs/heads/main"
+  echo "Fetching SageAttention from $URL"
+  if curl -fsSL --max-time 300 -o "$TGZ" "$URL"; then
+    # Verify it's actually a gzip file
+    if file "$TGZ" | grep -q 'gzip'; then
+      tar -xz -C "$DEST" --strip-components=1 -f "$TGZ"
+      local RET=$?
+      rm -f "$TGZ"
+      return $RET
+    else
+      echo "[WARN] Downloaded file is not a valid gzip archive (got: $(file "$TGZ"))"
+      rm -f "$TGZ"
+      return 1
+    fi
+  else
+    echo "[WARN] curl failed to download SageAttention tarball (exit $?)"
+    rm -f "$TGZ"
+    return 1
+  fi
+}
+
 if [[ "${MAKE_WHEELS:-0}" == "1" ]]; then
   echo "STAGE: Building sageattention wheel(s) (MAKE_WHEELS=1)"
   if [[ "$ARCH" == "none" ]]; then
@@ -1242,8 +1270,7 @@ if [[ "${MAKE_WHEELS:-0}" == "1" ]]; then
     mkdir -p "$SAGE_WHEEL_OUTPUT_DIR"
     TMP_SAGE_BUILD_DIR=$(mktemp -d /tmp/sageattention-src.XXXXXX)
     TMP_SAGE_WHEEL_DIR=$(mktemp -d /tmp/sageattention-out.XXXXXX)
-    echo "Downloading SageAttention source archive into $TMP_SAGE_BUILD_DIR"
-    if curl -sSL https://github.com/sageattention/SageAttention/archive/refs/heads/main.tar.gz | tar -xz -C "$TMP_SAGE_BUILD_DIR" --strip-components=1; then
+    if _sage_fetch_source "$TMP_SAGE_BUILD_DIR"; then
       echo "Building sageattention wheel in $TMP_SAGE_WHEEL_DIR"
       if (cd "$TMP_SAGE_BUILD_DIR" && pip wheel --no-deps --no-build-isolation --no-cache-dir . -w "$TMP_SAGE_WHEEL_DIR"); then
         BUILT_WHEEL=$(find "$TMP_SAGE_WHEEL_DIR" -maxdepth 1 -type f -name "sageattention-*.whl" -print -quit)
@@ -1279,7 +1306,7 @@ else
       else
           echo "No matching wheel found for architecture $ARCH, downloading and installing from source"
           TMP_CLONE_DIR=$(mktemp -d /tmp/sage-dl.XXXXXX)
-          if curl -sSL https://github.com/sageattention/SageAttention/archive/refs/heads/main.tar.gz | tar -xz -C "$TMP_CLONE_DIR" --strip-components=1; then
+          if _sage_fetch_source "$TMP_CLONE_DIR"; then
             pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_CLONE_DIR"
           fi
           rm -rf "$TMP_CLONE_DIR"
@@ -1288,7 +1315,7 @@ else
       echo "STAGE: Installing sageattention"
       echo "Installing sageattention from source tarball"
       TMP_CLONE_DIR=$(mktemp -d /tmp/sage-dl.XXXXXX)
-      if curl -sSL https://github.com/sageattention/SageAttention/archive/refs/heads/main.tar.gz | tar -xz -C "$TMP_CLONE_DIR" --strip-components=1; then
+      if _sage_fetch_source "$TMP_CLONE_DIR"; then
         pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_CLONE_DIR"
       fi
       rm -rf "$TMP_CLONE_DIR"
