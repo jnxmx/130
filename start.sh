@@ -1241,7 +1241,7 @@ _sage_fetch_source() {
   echo "Fetching SageAttention source repository..."
 
   # Method 1: Direct git clone
-  if GIT_TERMINAL_PROMPT=0 git clone --depth 1 https://github.com/sageattention/SageAttention.git "$DEST" 2>/dev/null; then
+  if GIT_TERMINAL_PROMPT=0 git clone --depth 1 https://github.com/thu-ml/SageAttention.git "$DEST" 2>/dev/null; then
     echo "Successfully cloned SageAttention via git"
     return 0
   fi
@@ -1251,7 +1251,7 @@ _sage_fetch_source() {
   # Method 2: Codeload tarball download
   local TGZ
   TGZ=$(mktemp /tmp/sageattention-XXXXXX.tar.gz)
-  local URL="https://codeload.github.com/sageattention/SageAttention/tar.gz/refs/heads/main"
+  local URL="https://codeload.github.com/thu-ml/SageAttention/tar.gz/refs/heads/main"
   if curl -fsSL --max-time 300 -o "$TGZ" "$URL" && file "$TGZ" | grep -q 'gzip'; then
     tar -xz -C "$DEST" --strip-components=1 -f "$TGZ"
     rm -f "$TGZ"
@@ -1262,7 +1262,7 @@ _sage_fetch_source() {
 
   # Method 3: GitHub archive tarball download
   TGZ=$(mktemp /tmp/sageattention-XXXXXX.tar.gz)
-  URL="https://github.com/sageattention/SageAttention/archive/refs/heads/main.tar.gz"
+  URL="https://github.com/thu-ml/SageAttention/archive/refs/heads/main.tar.gz"
   if curl -fsSL --max-time 300 -L -o "$TGZ" "$URL" && file "$TGZ" | grep -q 'gzip'; then
     tar -xz -C "$DEST" --strip-components=1 -f "$TGZ"
     rm -f "$TGZ"
