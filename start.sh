@@ -1286,7 +1286,7 @@ if [[ "${MAKE_WHEELS:-0}" == "1" ]]; then
     if _sage_fetch_source "$TMP_SAGE_BUILD_DIR"; then
       echo "Building sageattention wheel for $ARCH in $TMP_SAGE_WHEEL_DIR..."
       # Set target CUDA arch list to avoid building redundant kernels and reduce memory pressure
-      local CUDA_ARCH_VER=""
+      CUDA_ARCH_VER=""
       case "$ARCH" in
         sm120) CUDA_ARCH_VER="12.0" ;;
         sm89)  CUDA_ARCH_VER="8.9" ;;
@@ -1332,7 +1332,7 @@ else
           echo "No matching wheel found for architecture $ARCH, downloading and installing from source"
           TMP_CLONE_DIR=$(mktemp -d /tmp/sage-dl.XXXXXX)
           if _sage_fetch_source "$TMP_CLONE_DIR"; then
-            local CUDA_ARCH_VER=""
+            CUDA_ARCH_VER=""
             case "$ARCH" in
               sm120) CUDA_ARCH_VER="12.0" ;;
               sm89)  CUDA_ARCH_VER="8.9" ;;
