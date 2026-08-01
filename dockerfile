@@ -16,6 +16,7 @@ RUN apt update && apt install -y --no-install-recommends \
     libgles2 \
     libegl-mesa0 \
     dos2unix \
+    file \
     ncdu \
     nginx \
     psmisc \

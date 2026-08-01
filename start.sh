@@ -1223,7 +1223,7 @@ patch_legacy_manager_blacklist_guard
 # --- Install/build sageattention based on GPU architecture ---
 SAGEATTENTION_VERSION="2.2.0"
 SAGE_WHEEL_OUTPUT_DIR="/workspace/wheels"
-ARCH=$(python3 - <<'EOF'
+ARCH=$(python3 - <<'EOF' || echo "none"
 import torch
 if not torch.cuda.is_available():
     print("none")
@@ -1249,10 +1249,11 @@ _sage_fetch_source() {
   echo "[WARN] git clone failed, falling back to HTTPS archive download"
 
   # Method 2: Codeload tarball download
+  rm -rf "${DEST:?}"/*
   local TGZ
   TGZ=$(mktemp /tmp/sageattention-XXXXXX.tar.gz)
   local URL="https://codeload.github.com/thu-ml/SageAttention/tar.gz/refs/heads/main"
-  if curl -fsSL --max-time 300 -o "$TGZ" "$URL" && file "$TGZ" | grep -q 'gzip'; then
+  if curl -fsSL --max-time 300 -o "$TGZ" "$URL" && gzip -t "$TGZ" 2>/dev/null; then
     tar -xz -C "$DEST" --strip-components=1 -f "$TGZ"
     rm -f "$TGZ"
     echo "Successfully downloaded SageAttention via codeload tarball"
@@ -1261,9 +1262,10 @@ _sage_fetch_source() {
   rm -f "$TGZ"
 
   # Method 3: GitHub archive tarball download
+  rm -rf "${DEST:?}"/*
   TGZ=$(mktemp /tmp/sageattention-XXXXXX.tar.gz)
   URL="https://github.com/thu-ml/SageAttention/archive/refs/heads/main.tar.gz"
-  if curl -fsSL --max-time 300 -L -o "$TGZ" "$URL" && file "$TGZ" | grep -q 'gzip'; then
+  if curl -fsSL --max-time 300 -L -o "$TGZ" "$URL" && gzip -t "$TGZ" 2>/dev/null; then
     tar -xz -C "$DEST" --strip-components=1 -f "$TGZ"
     rm -f "$TGZ"
     echo "Successfully downloaded SageAttention via github archive tarball"
@@ -1298,10 +1300,10 @@ if [[ "${MAKE_WHEELS:-0}" == "1" ]]; then
           MAX_JOBS=4 \
           ${CUDA_ARCH_VER:+TORCH_CUDA_ARCH_LIST="$CUDA_ARCH_VER"} \
           pip wheel --no-deps --no-build-isolation --no-cache-dir . -w "$TMP_SAGE_WHEEL_DIR"); then
-        BUILT_WHEEL=$(find "$TMP_SAGE_WHEEL_DIR" -maxdepth 1 -type f -name "sageattention-*.whl" -print -quit)
+        BUILT_WHEEL=$(find "$TMP_SAGE_WHEEL_DIR" -maxdepth 1 -type f -name "sageattention-*.whl" -print -quit 2>/dev/null || true)
         if [[ -n "$BUILT_WHEEL" ]]; then
           BASE_NAME=$(basename "$BUILT_WHEEL")
-          VER_STR=$(echo "$BASE_NAME" | sed -E 's/sageattention-([0-9\.]+)-.*/\1/')
+          VER_STR=$(echo "$BASE_NAME" | sed -E 's/^sageattention-([^-]+)-.*/\1/' || true)
           RENAMED_NAME="${BASE_NAME/sageattention-${VER_STR}-/sageattention-${VER_STR}+${ARCH}-}"
           TARGET_PATH="${SAGE_WHEEL_OUTPUT_DIR}/${RENAMED_NAME}"
           mv "$BUILT_WHEEL" "$TARGET_PATH"
@@ -1324,7 +1326,7 @@ if [[ "${MAKE_WHEELS:-0}" == "1" ]]; then
 else
   if [ "$ARCH" != "none" ]; then
       echo "STAGE: Installing sageattention"
-      WHEEL_FILE=$(find /wheels /workspace/wheels -type f -name "sageattention-*+${ARCH}-*.whl" 2>/dev/null | head -n 1)
+      WHEEL_FILE=$(find /wheels /workspace/wheels -type f -name "sageattention-*+${ARCH}-*.whl" 2>/dev/null | head -n 1 || true)
       if [ -n "$WHEEL_FILE" ]; then
           echo "Installing sageattention wheel for architecture $ARCH"
           pip_install "$VIRTUAL_ENV/bin/python" --no-deps "$WHEEL_FILE"
