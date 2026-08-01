@@ -1282,8 +1282,8 @@ if [[ "${MAKE_WHEELS:-0}" == "1" ]]; then
   if [[ "$ARCH" == "none" ]]; then
     echo "[WARN] No supported GPU architecture detected; skipping sageattention wheel build."
   else
-    echo "[deps] Ensuring build toolchain (build-essential, python3-dev) is installed..."
-    apt-get update -qq && apt-get install -y --no-install-recommends build-essential python3-dev -qq || true
+    echo "[deps] Ensuring build toolchain (build-essential, python3-dev, libcusparse-dev) is installed..."
+    apt-get update -qq && apt-get install -y --no-install-recommends build-essential python3-dev libcusparse-dev -qq || true
     mkdir -p "$SAGE_WHEEL_OUTPUT_DIR"
     TMP_SAGE_BUILD_DIR=$(mktemp -d /tmp/sageattention-src.XXXXXX)
     TMP_SAGE_WHEEL_DIR=$(mktemp -d /tmp/sageattention-out.XXXXXX)
