@@ -1365,7 +1365,7 @@ if [[ "${MAKE_WHEELS:-0}" == "1" ]]; then
     echo "[WARN] No supported GPU architecture detected; skipping sageattention wheel build."
   else
     echo "[deps] Ensuring build toolchain (build-essential, python3-dev, CUDA headers) is installed..."
-    apt-get update -qq && apt-get install -y --no-install-recommends build-essential python3-dev cuda-nvcc-13-0 cuda-cudart-dev-13-0 libcublas-dev-13-0 libcusparse-dev-13-0 -qq 2>/dev/null || apt-get install -y --no-install-recommends build-essential python3-dev -qq 2>/dev/null || true
+    apt-get update -qq && (apt-get install -y --no-install-recommends build-essential python3-dev libcublas-dev libcusparse-dev -qq || apt-get install -y --no-install-recommends build-essential python3-dev -qq) 2>/dev/null || true
     mkdir -p "$SAGE_WHEEL_OUTPUT_DIR"
     TMP_SAGE_BUILD_DIR=$(mktemp -d /tmp/sageattention-src.XXXXXX)
     TMP_SAGE_WHEEL_DIR=$(mktemp -d /tmp/sageattention-out.XXXXXX)
