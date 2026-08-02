@@ -13,7 +13,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 export VIRTUAL_ENV
 
 # Container script version marker
-SCRIPT_VERSION="v2.2.0-build-patch-cuda130"
+SCRIPT_VERSION="v2.2.1-build-patch-cuda130"
 echo "========================================================"
 echo "[init] Starting container script version: $SCRIPT_VERSION"
 echo "========================================================"
