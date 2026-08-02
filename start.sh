@@ -1277,32 +1277,101 @@ _sage_fetch_source() {
   return 1
 }
 
+_sage_patch_and_build_env() {
+  local DEST="$1"
+  local ARCH_TARGET="$2"
+
+  # 1. Setup CUDA_HOME & PATHs based on PyTorch's CUDA version
+  local PYTORCH_CUDA_VER=""
+  PYTORCH_CUDA_VER="$("$VIRTUAL_ENV/bin/python" -c "import torch; print(torch.version.cuda if torch.cuda.is_available() else '')" 2>/dev/null || true)"
+  
+  local DETECTED_CUDA_HOME=""
+  if [[ -n "$PYTORCH_CUDA_VER" && -d "/usr/local/cuda-${PYTORCH_CUDA_VER}" ]]; then
+    DETECTED_CUDA_HOME="/usr/local/cuda-${PYTORCH_CUDA_VER}"
+  elif [[ -d "/usr/local/cuda" ]]; then
+    DETECTED_CUDA_HOME="/usr/local/cuda"
+  elif command -v nvcc >/dev/null 2>&1; then
+    DETECTED_CUDA_HOME="$(dirname "$(dirname "$(which nvcc)")")"
+  fi
+
+  if [[ -n "$DETECTED_CUDA_HOME" ]]; then
+    export CUDA_HOME="$DETECTED_CUDA_HOME"
+    export PATH="$CUDA_HOME/bin:$PATH"
+    export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${CUDA_HOME}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
+    export CFLAGS="-I${CUDA_HOME}/include -I${CUDA_HOME}/targets/x86_64-linux/include ${CFLAGS:-}"
+    export CXXFLAGS="-I${CUDA_HOME}/include -I${CUDA_HOME}/targets/x86_64-linux/include ${CXXFLAGS:-}"
+    echo "[sage] Using CUDA_HOME: $CUDA_HOME"
+  fi
+
+  # 2. Patch source headers and setup.py (from Easy-Install reference scripts)
+  "$VIRTUAL_ENV/bin/python" - "$DEST" <<'PY'
+import os, sys
+
+dest = sys.argv[1]
+print(f"[sage] Patching SageAttention source files in {dest}...")
+
+# Add missing C++ std headers
+patch_files = [
+    os.path.join(dest, 'csrc/fused/fused.cu'),
+    os.path.join(dest, 'csrc/qattn/qk_int_sv_f16_cuda_sm80.cu'),
+    os.path.join(dest, 'csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh'),
+]
+for fpath in patch_files:
+    if os.path.exists(fpath):
+        with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        if '#include <vector>' not in content:
+            new_content = '#include <vector>\n#include <typeindex>\n' + content
+            with open(fpath, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            print(f"[sage] Added vector/typeindex headers to {os.path.basename(fpath)}")
+
+# Patch setup.py C++ flags to use std=c++20 & ENABLE_BF16
+setup_path = os.path.join(dest, 'setup.py')
+if os.path.exists(setup_path):
+    with open(setup_path, 'r', encoding='utf-8', errors='ignore') as f:
+        setup_content = f.read()
+    setup_content = setup_content.replace(
+        'CXX_FLAGS = ["/O2", "/openmp"]',
+        'CXX_FLAGS = ["/O2", "/openmp", "-std=c++20", "-DENABLE_BF16"]'
+    )
+    setup_content = setup_content.replace('"-std=c++17"', '"-std=c++20"')
+    with open(setup_path, 'w', encoding='utf-8') as f:
+        f.write(setup_content)
+    print("[sage] Patched setup.py flags to C++20")
+PY
+
+  # 3. Environment compilation flags
+  CUDA_ARCH_VER=""
+  case "$ARCH_TARGET" in
+    sm120) CUDA_ARCH_VER="12.0" ;;
+    sm89)  CUDA_ARCH_VER="8.9" ;;
+    sm86)  CUDA_ARCH_VER="8.6" ;;
+    *)     CUDA_ARCH_VER="" ;;
+  esac
+
+  export MAX_JOBS=4
+  export NINJA_MAX_JOBS=4
+  export EXT_PARALLEL=4
+  export NVCC_APPEND_FLAGS="--threads 4"
+  if [[ -n "$CUDA_ARCH_VER" ]]; then
+    export TORCH_CUDA_ARCH_LIST="$CUDA_ARCH_VER"
+  fi
+}
+
 if [[ "${MAKE_WHEELS:-0}" == "1" ]]; then
   echo "STAGE: Building sageattention wheel(s) (MAKE_WHEELS=1)"
   if [[ "$ARCH" == "none" ]]; then
     echo "[WARN] No supported GPU architecture detected; skipping sageattention wheel build."
   else
-    echo "[deps] Ensuring build toolchain (build-essential, python3-dev, libcusparse-dev) is installed..."
-    apt-get update -qq && apt-get install -y --no-install-recommends build-essential python3-dev libcusparse-dev -qq || true
+    echo "[deps] Ensuring build toolchain (build-essential, python3-dev, CUDA headers) is installed..."
+    apt-get update -qq && apt-get install -y --no-install-recommends build-essential python3-dev cuda-nvcc-13-0 cuda-cudart-dev-13-0 libcublas-dev-13-0 libcusparse-dev-13-0 -qq 2>/dev/null || apt-get install -y --no-install-recommends build-essential python3-dev -qq 2>/dev/null || true
     mkdir -p "$SAGE_WHEEL_OUTPUT_DIR"
     TMP_SAGE_BUILD_DIR=$(mktemp -d /tmp/sageattention-src.XXXXXX)
     TMP_SAGE_WHEEL_DIR=$(mktemp -d /tmp/sageattention-out.XXXXXX)
     if _sage_fetch_source "$TMP_SAGE_BUILD_DIR"; then
       echo "Building sageattention wheel for $ARCH in $TMP_SAGE_WHEEL_DIR..."
-      # Set target CUDA arch list to avoid building redundant kernels and reduce memory pressure
-      CUDA_ARCH_VER=""
-      case "$ARCH" in
-        sm120) CUDA_ARCH_VER="12.0" ;;
-        sm89)  CUDA_ARCH_VER="8.9" ;;
-        sm86)  CUDA_ARCH_VER="8.6" ;;
-        *)     CUDA_ARCH_VER="" ;;
-      esac
-
-      export MAX_JOBS=2
-      export NINJA_MAX_JOBS=2
-      if [[ -n "$CUDA_ARCH_VER" ]]; then
-        export TORCH_CUDA_ARCH_LIST="$CUDA_ARCH_VER"
-      fi
+      _sage_patch_and_build_env "$TMP_SAGE_BUILD_DIR" "$ARCH"
 
       if "$VIRTUAL_ENV/bin/python" -m pip wheel --no-deps --no-build-isolation --no-cache-dir "$TMP_SAGE_BUILD_DIR" -w "$TMP_SAGE_WHEEL_DIR"; then
         BUILT_WHEEL=$(find "$TMP_SAGE_WHEEL_DIR" -maxdepth 1 -type f -name "sageattention-*.whl" -print -quit 2>/dev/null || true)
@@ -1323,7 +1392,7 @@ if [[ "${MAKE_WHEELS:-0}" == "1" ]]; then
         echo "[WARN] Failed to build sageattention wheel; installing from source directly"
         pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_SAGE_BUILD_DIR"
       fi
-      unset MAX_JOBS NINJA_MAX_JOBS TORCH_CUDA_ARCH_LIST 2>/dev/null || true
+      unset MAX_JOBS NINJA_MAX_JOBS EXT_PARALLEL NVCC_APPEND_FLAGS TORCH_CUDA_ARCH_LIST CUDA_HOME 2>/dev/null || true
     else
       echo "[WARN] Failed to download SageAttention source archive"
     fi
@@ -1340,20 +1409,9 @@ else
           echo "No matching wheel found for architecture $ARCH, downloading and installing from source"
           TMP_CLONE_DIR=$(mktemp -d /tmp/sage-dl.XXXXXX)
           if _sage_fetch_source "$TMP_CLONE_DIR"; then
-            CUDA_ARCH_VER=""
-            case "$ARCH" in
-              sm120) CUDA_ARCH_VER="12.0" ;;
-              sm89)  CUDA_ARCH_VER="8.9" ;;
-              sm86)  CUDA_ARCH_VER="8.6" ;;
-              *)     CUDA_ARCH_VER="" ;;
-            esac
-            export MAX_JOBS=2
-            export NINJA_MAX_JOBS=2
-            if [[ -n "$CUDA_ARCH_VER" ]]; then
-              export TORCH_CUDA_ARCH_LIST="$CUDA_ARCH_VER"
-            fi
+            _sage_patch_and_build_env "$TMP_CLONE_DIR" "$ARCH"
             pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_CLONE_DIR"
-            unset MAX_JOBS NINJA_MAX_JOBS TORCH_CUDA_ARCH_LIST 2>/dev/null || true
+            unset MAX_JOBS NINJA_MAX_JOBS EXT_PARALLEL NVCC_APPEND_FLAGS TORCH_CUDA_ARCH_LIST CUDA_HOME 2>/dev/null || true
           fi
           rm -rf "$TMP_CLONE_DIR"
       fi
@@ -1362,10 +1420,9 @@ else
       echo "Installing sageattention from source tarball"
       TMP_CLONE_DIR=$(mktemp -d /tmp/sage-dl.XXXXXX)
       if _sage_fetch_source "$TMP_CLONE_DIR"; then
-        export MAX_JOBS=2
-        export NINJA_MAX_JOBS=2
+        _sage_patch_and_build_env "$TMP_CLONE_DIR" "none"
         pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_CLONE_DIR"
-        unset MAX_JOBS NINJA_MAX_JOBS 2>/dev/null || true
+        unset MAX_JOBS NINJA_MAX_JOBS EXT_PARALLEL NVCC_APPEND_FLAGS TORCH_CUDA_ARCH_LIST CUDA_HOME 2>/dev/null || true
       fi
       rm -rf "$TMP_CLONE_DIR"
   fi
