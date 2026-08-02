@@ -1413,6 +1413,10 @@ else
           pip_install "$VIRTUAL_ENV/bin/python" --no-deps "$WHEEL_FILE"
       else
           echo "No matching wheel found for architecture $ARCH, downloading and installing from source"
+          if ! dpkg -s libcusparse-dev >/dev/null 2>&1; then
+            echo "Installing libcusparse-dev dependency for CUDA extension compilation..."
+            apt-get update -qq && apt-get install -y --no-install-recommends libcusparse-dev -qq || true
+          fi
           TMP_CLONE_DIR=$(mktemp -d /tmp/sage-dl.XXXXXX)
           if _sage_fetch_source "$TMP_CLONE_DIR"; then
             _sage_patch_and_build_env "$TMP_CLONE_DIR" "$ARCH"
@@ -1424,6 +1428,10 @@ else
   else
       echo "STAGE: Installing sageattention"
       echo "Installing sageattention from source tarball"
+      if ! dpkg -s libcusparse-dev >/dev/null 2>&1; then
+        echo "Installing libcusparse-dev dependency for CUDA extension compilation..."
+        apt-get update -qq && apt-get install -y --no-install-recommends libcusparse-dev -qq || true
+      fi
       TMP_CLONE_DIR=$(mktemp -d /tmp/sage-dl.XXXXXX)
       if _sage_fetch_source "$TMP_CLONE_DIR"; then
         _sage_patch_and_build_env "$TMP_CLONE_DIR" "none"
