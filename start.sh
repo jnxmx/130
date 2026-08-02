@@ -1341,7 +1341,7 @@ if os.path.exists(setup_path):
         'CXX_FLAGS = ["/O2", "/openmp"]',
         'CXX_FLAGS = ["/O2", "/openmp", "-std=c++20", "-DENABLE_BF16"]'
     )
-    setup_content = setup_content.replace('"-std=c++17"', '"-std=c++20"')
+    setup_content = setup_content.replace('-std=c++17', '-std=c++20')
     with open(setup_path, 'w', encoding='utf-8') as f:
         f.write(setup_content)
     print("[sage] Patched setup.py flags to C++20")
