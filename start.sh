@@ -12,6 +12,12 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 : "${VIRTUAL_ENV:=/workspace/ComfyUI/venv}"
 export VIRTUAL_ENV
 
+# Container script version marker
+SCRIPT_VERSION="v2.2.0-build-patch-cuda130"
+echo "========================================================"
+echo "[init] Starting container script version: $SCRIPT_VERSION"
+echo "========================================================"
+
 # Quiet noisy warnings and pip notices globally
 export PYTHONWARNINGS="ignore"
 export PIP_DISABLE_PIP_VERSION_CHECK="1"
@@ -1360,7 +1366,7 @@ PY
 }
 
 if [[ "${MAKE_WHEELS:-0}" == "1" ]]; then
-  echo "STAGE: Building sageattention wheel(s) (MAKE_WHEELS=1)"
+  echo "STAGE: Building sageattention wheel(s) (MAKE_WHEELS=1) [$SCRIPT_VERSION]"
   if [[ "$ARCH" == "none" ]]; then
     echo "[WARN] No supported GPU architecture detected; skipping sageattention wheel build."
   else
