@@ -778,7 +778,8 @@ if not sys_site:
 
 patterns = [
     "torch*", "functorch*", "torchvision*", "torchaudio*",
-    "nvidia*", "triton*", "cuda*", "cublas*", "cudnn*", "caffe2*"
+    "nvidia*", "triton*", "cuda*", "cublas*", "cudnn*", "caffe2*",
+    "hf_transfer*", "hf-transfer*", "huggingface_hub*"
 ]
 
 # 1. Clean stale/broken packages or symlinks in target_site that do not match sys_site
@@ -853,8 +854,12 @@ PY
   for d in "$FIZGIG_VENV"/lib/python*/site-packages/functorch; do
     if [[ -d "$d" ]]; then functorch_present=1; break; fi
   done
+  local hf_transfer_present=0
+  if "$FIZGIG_VENV/bin/python" -c "import hf_transfer" 2>/dev/null; then
+    hf_transfer_present=1
+  fi
 
-  if [[ "$venv_needed" == "1" || "$old_commit" != "$new_commit" || ! -f "$FIZGIG_DIR/.prepared" || ! -f "$FIZGIG_VENV/.isolated_torch_linked" || "$functorch_present" != "1" ]]; then
+  if [[ "$venv_needed" == "1" || "$old_commit" != "$new_commit" || ! -f "$FIZGIG_DIR/.prepared" || ! -f "$FIZGIG_VENV/.isolated_torch_linked" || "$functorch_present" != "1" || "$hf_transfer_present" != "1" ]]; then
     echo "[fizgig] ensuring pip and uv in venv..." >> /fizgig_setup.log
     "$FIZGIG_VENV/bin/python" -m pip install --upgrade pip uv >> /fizgig_setup.log 2>&1 || true
 
@@ -863,6 +868,8 @@ PY
       local tmp_req="$FIZGIG_DIR/requirements.no-torch.txt"
       # Strip --extra-index-url (which hardcodes cu128 in Fizgig repo) so we retain CUDA 13.0
       grep -Ev '^\s*--extra-index-url' "$FIZGIG_DIR/requirements.txt" > "$tmp_req" 2>/dev/null || cp "$FIZGIG_DIR/requirements.txt" "$tmp_req"
+      # Ensure hf_transfer is installed for fast downloads and HF_HUB_ENABLE_HF_TRANSFER compatibility
+      grep -q "^hf_transfer" "$tmp_req" 2>/dev/null || echo "hf_transfer" >> "$tmp_req"
 
       local constraint_args=()
       if [[ -n "${PIP_CONSTRAINT:-}" && -f "${PIP_CONSTRAINT}" ]]; then
@@ -1945,7 +1952,11 @@ launch_fizgig_runtime() {
   fi
   echo "[fizgig] starting web UI on :$FIZGIG_UI_PORT (PATH prefixed with venv)" >> /fizgig_setup.log
   cd "$FIZGIG_DIR" || return 1
-  env -u VNC_PASSWORD -u FIZGIG_PASSWORD \
+  local hf_env=()
+  if ! "$FIZGIG_VENV/bin/python" -c "import hf_transfer" 2>/dev/null; then
+    hf_env=(-u HF_HUB_ENABLE_HF_TRANSFER)
+  fi
+  env -u VNC_PASSWORD -u FIZGIG_PASSWORD "${hf_env[@]}" \
     PATH="$FIZGIG_VENV/bin:$PATH" \
     VIRTUAL_ENV="$FIZGIG_VENV" \
     PYTHON="$FIZGIG_VENV/bin/python" \
