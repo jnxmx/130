@@ -742,9 +742,11 @@ prepare_fizgig_runtime() {
   fi
 
   # Symlink system PyTorch & CUDA packages into isolated venv (zero download, CUDA 13 retained)
+  # NOTE: .dist-info directories MUST be copied (not symlinked) so Rust-based uv detects
+  # packages as already installed and skips re-resolving/re-downloading 3GB+ of PyTorch wheels.
   echo "[fizgig] linking system CUDA 13 PyTorch packages into isolated venv..." >> /fizgig_setup.log
   FIZGIG_VENV="$FIZGIG_VENV" python3 - <<'PY' >> /fizgig_setup.log 2>&1
-import os, sys, glob
+import os, sys, glob, shutil
 from pathlib import Path
 
 target_site = None
@@ -774,20 +776,52 @@ if not sys_site:
     except Exception:
         sys_site = "/usr/local/lib/python3.12/dist-packages"
 
-patterns = ["torch*", "torchvision*", "torchaudio*", "nvidia*", "triton*"]
-linked = 0
+patterns = [
+    "torch*", "torchvision*", "torchaudio*",
+    "nvidia*", "triton*", "cuda*", "cublas*", "cudnn*"
+]
+
+# 1. Clean stale/broken packages or symlinks in target_site that do not match sys_site
+for pat in patterns:
+    for dst in target_site.glob(pat):
+        if dst.name.endswith((".dist-info", ".egg-info")):
+            if dst.is_dir() and not dst.is_symlink():
+                shutil.rmtree(dst, ignore_errors=True)
+            else:
+                dst.unlink(missing_ok=True)
+        else:
+            if dst.is_symlink():
+                try:
+                    target = os.readlink(str(dst))
+                    if not target.startswith(sys_site):
+                        dst.unlink(missing_ok=True)
+                except OSError:
+                    dst.unlink(missing_ok=True)
+            elif dst.is_dir():
+                shutil.rmtree(dst, ignore_errors=True)
+            elif dst.is_file():
+                dst.unlink(missing_ok=True)
+
+# 2. Copy .dist-info so uv & pip detect packages as already installed; symlink code directories/files
+copied_dist_info = 0
+linked_pkgs = 0
 for pat in patterns:
     for src in glob.glob(os.path.join(sys_site, pat)):
         name = os.path.basename(src)
         dst = target_site / name
-        if not dst.exists() and not dst.is_symlink():
-            try:
-                dst.symlink_to(src)
-                linked += 1
-            except Exception as e:
-                print(f"[fizgig][warn] could not link {name}: {e}")
+        try:
+            if name.endswith((".dist-info", ".egg-info")):
+                if os.path.isdir(src):
+                    shutil.copytree(src, dst)
+                    copied_dist_info += 1
+            else:
+                if not dst.exists() and not dst.is_symlink():
+                    dst.symlink_to(src)
+                    linked_pkgs += 1
+        except Exception as e:
+            print(f"[fizgig][warn] could not link/copy {name}: {e}")
 
-print(f"[fizgig] linked {linked} torch/cuda package entries from system into isolated venv")
+print(f"[fizgig] linked {linked_pkgs} packages and copied {copied_dist_info} dist-info entries from system into isolated venv")
 PY
 
   # 3. Dependencies installation (only if venv created or repo updated or not marked prepared)
@@ -798,17 +832,31 @@ PY
     if [[ -f "$FIZGIG_DIR/requirements.txt" ]]; then
       echo "[fizgig] installing requirements into isolated venv..." >> /fizgig_setup.log
       local tmp_req="$FIZGIG_DIR/requirements.no-torch.txt"
-      grep -Ev '^(torch|torchvision|torchaudio)($|[<>=])|--extra-index-url' "$FIZGIG_DIR/requirements.txt" > "$tmp_req" 2>/dev/null || cp "$FIZGIG_DIR/requirements.txt" "$tmp_req"
+      # Strip --extra-index-url (which hardcodes cu128 in Fizgig repo) so we retain CUDA 13.0
+      grep -Ev '^\s*--extra-index-url' "$FIZGIG_DIR/requirements.txt" > "$tmp_req" 2>/dev/null || cp "$FIZGIG_DIR/requirements.txt" "$tmp_req"
 
-      # Install with clean environment so PyTorch cu130 extra-index does not shadow PyPI packages like tqdm
-      if env -u UV_EXTRA_INDEX_URL -u PIP_EXTRA_INDEX_URL -u UV_CONSTRAINT -u PIP_CONSTRAINT DISABLE_CUDA=1 \
-          "$FIZGIG_VENV/bin/python" -m uv pip install --index-strategy unsafe-best-match -r "$tmp_req" >> /fizgig_setup.log 2>&1; then
+      local constraint_args=()
+      if [[ -n "${PIP_CONSTRAINT:-}" && -f "${PIP_CONSTRAINT}" ]]; then
+        constraint_args=(--constraint "$PIP_CONSTRAINT")
+      fi
+
+      export UV_LINK_MODE="copy"
+
+      if env DISABLE_CUDA=1 \
+          "$FIZGIG_VENV/bin/python" -m uv pip install \
+            --link-mode=copy \
+            --index-strategy unsafe-best-match \
+            "${constraint_args[@]}" \
+            -r "$tmp_req" >> /fizgig_setup.log 2>&1; then
         echo "[fizgig] dependencies installed successfully via uv pip" >> /fizgig_setup.log
         touch "$FIZGIG_VENV/.isolated_torch_linked"
       else
         echo "[fizgig][warn] uv pip install failed, attempting pip fallback..." >> /fizgig_setup.log
-        env -u UV_EXTRA_INDEX_URL -u PIP_EXTRA_INDEX_URL -u UV_CONSTRAINT -u PIP_CONSTRAINT DISABLE_CUDA=1 \
-          "$FIZGIG_VENV/bin/python" -m pip install -r "$tmp_req" >> /fizgig_setup.log 2>&1 || true
+        env DISABLE_CUDA=1 \
+          "$FIZGIG_VENV/bin/python" -m pip install \
+            --no-build-isolation \
+            "${constraint_args[@]}" \
+            -r "$tmp_req" >> /fizgig_setup.log 2>&1 || true
         touch "$FIZGIG_VENV/.isolated_torch_linked"
       fi
     fi
@@ -1340,6 +1388,17 @@ cleanup_legacy_manager
 if [[ ! -d "$VIRTUAL_ENV" ]]; then
   echo "Creating venv at $VIRTUAL_ENV…"
   python3 -m venv "$VIRTUAL_ENV" --system-site-packages
+else
+  # Sanity check: if venv has a broken torch (e.g. CPU torch or mismatched cuDNN from a bad install on persisted volume),
+  # clean shadowed packages in venv site-packages so it cleanly falls through to the base image CUDA 13 PyTorch.
+  if ! "$VIRTUAL_ENV/bin/python" -c "import torch; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+    echo "[comfyui][warn] venv torch is broken or missing CUDA; cleaning shadowed venv packages to restore system CUDA 13 PyTorch..."
+    for sp in "$VIRTUAL_ENV"/lib/python*/site-packages; do
+      if [[ -d "$sp" ]]; then
+        rm -rf "$sp"/torch* "$sp"/torchvision* "$sp"/torchaudio* "$sp"/nvidia* "$sp"/triton* 2>/dev/null || true
+      fi
+    done
+  fi
 fi
 if [[ -f "$VIRTUAL_ENV/bin/activate" ]]; then
   # shellcheck disable=SC1091
