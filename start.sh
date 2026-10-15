@@ -799,15 +799,18 @@ PY
       local tmp_req="$FIZGIG_DIR/requirements.no-torch.txt"
       grep -Ev '^(torch|torchvision|torchaudio)($|[<>=])|--extra-index-url' "$FIZGIG_DIR/requirements.txt" > "$tmp_req" 2>/dev/null || cp "$FIZGIG_DIR/requirements.txt" "$tmp_req"
 
-      if [[ -f "$FIZGIG_DIR/uv_install_deps.py" ]]; then
-        echo "[fizgig] installing / checking dependencies via uv_install_deps.py..." >> /fizgig_setup.log
-        DISABLE_CUDA=1 "$FIZGIG_VENV/bin/python" "$FIZGIG_DIR/uv_install_deps.py" "$tmp_req" "$FIZGIG_VENV" >> /fizgig_setup.log 2>&1 || true
+      # Install with clean environment so PyTorch cu130 extra-index does not shadow PyPI packages like tqdm
+      if env -u UV_EXTRA_INDEX_URL -u PIP_EXTRA_INDEX_URL -u UV_CONSTRAINT -u PIP_CONSTRAINT DISABLE_CUDA=1 \
+          "$FIZGIG_VENV/bin/python" -m uv pip install --index-strategy unsafe-best-match -r "$tmp_req" >> /fizgig_setup.log 2>&1; then
+        echo "[fizgig] dependencies installed successfully via uv pip" >> /fizgig_setup.log
+        touch "$FIZGIG_VENV/.isolated_torch_linked"
       else
-        echo "[fizgig] installing dependencies via uv pip..." >> /fizgig_setup.log
-        DISABLE_CUDA=1 "$FIZGIG_VENV/bin/python" -m uv pip install -r "$tmp_req" >> /fizgig_setup.log 2>&1 || true
+        echo "[fizgig][warn] uv pip install failed, attempting pip fallback..." >> /fizgig_setup.log
+        env -u UV_EXTRA_INDEX_URL -u PIP_EXTRA_INDEX_URL -u UV_CONSTRAINT -u PIP_CONSTRAINT DISABLE_CUDA=1 \
+          "$FIZGIG_VENV/bin/python" -m pip install -r "$tmp_req" >> /fizgig_setup.log 2>&1 || true
+        touch "$FIZGIG_VENV/.isolated_torch_linked"
       fi
     fi
-    touch "$FIZGIG_VENV/.isolated_torch_linked"
   else
     echo "[fizgig] isolated venv and requirements already up to date (${new_commit:0:7})" >> /fizgig_setup.log
   fi
@@ -923,9 +926,16 @@ prefs_file.write_text(json.dumps(prefs, indent=2), encoding="utf-8")
 print("[fizgig] updated prefs.json with ComfyUI shared models and loras output dir")
 PY
 
-  touch "$FIZGIG_DIR/.prepared"
-  touch /tmp/fizgig_prep.done
-  echo "[fizgig] preparation complete and verified." >> /fizgig_setup.log
+  if [[ -f "$FIZGIG_VENV/.isolated_torch_linked" ]]; then
+    touch "$FIZGIG_DIR/.prepared"
+    touch /tmp/fizgig_prep.done
+    echo "[fizgig] preparation complete and verified." >> /fizgig_setup.log
+  else
+    echo "[fizgig][error] preparation finished with errors; dependencies not verified." >> /fizgig_setup.log
+    rm -f "$lock_file" 2>/dev/null || true
+    set -e
+    return 1
+  fi
   rm -f "$lock_file" 2>/dev/null || true
   set -e
   return 0
