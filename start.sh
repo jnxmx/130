@@ -783,6 +783,64 @@ if server_file.is_file():
         text = text.replace('a = ap.parse_args(argv)', 'a = ap.parse_args(argv)\n    a.password = None')
     server_file.write_text(text, encoding="utf-8")
     print("[fizgig] password authentication and host check disabled in server.py")
+
+# Patch batch_caption.py for Florence-2 compatibility with newer transformers
+batch_caption_file = Path(fizgig_dir) / "src" / "fizgig" / "scripts" / "batch_caption.py"
+if batch_caption_file.is_file():
+    text = batch_caption_file.read_text(encoding="utf-8")
+    target_str = "    from transformers import AutoModelForCausalLM, AutoProcessor"
+    patch_str = """    from transformers import AutoModelForCausalLM, AutoProcessor
+    from transformers.configuration_utils import PretrainedConfig
+    from transformers.modeling_utils import PreTrainedModel
+    PretrainedConfig.forced_bos_token_id = None
+    PreTrainedModel._supports_sdpa = True"""
+    if "PretrainedConfig.forced_bos_token_id = None" not in text:
+        text = text.replace(target_str, patch_str)
+        batch_caption_file.write_text(text, encoding="utf-8")
+        print("[fizgig] patched batch_caption.py for Florence-2 transformers compatibility")
+
+# Install sitecustomize.py in venvs and system python so all processes inherit the fix
+sc_code = """# Florence-2 compatibility patch for transformers >= 4.48
+try:
+    import transformers.configuration_utils
+    transformers.configuration_utils.PretrainedConfig.forced_bos_token_id = None
+except Exception:
+    pass
+
+try:
+    import transformers.modeling_utils
+    transformers.modeling_utils.PreTrainedModel._supports_sdpa = True
+except Exception:
+    pass
+"""
+for d in [
+    os.environ.get("FIZGIG_VENV", "") + "/lib/python3.12/site-packages",
+    "/workspace/ComfyUI/venv/lib/python3.12/site-packages",
+    "/usr/local/lib/python3.12/dist-packages"
+]:
+    dp = Path(d)
+    if dp.is_dir():
+        sc = dp / "sitecustomize.py"
+        existing = sc.read_text(encoding="utf-8") if sc.is_file() else ""
+        if "PretrainedConfig.forced_bos_token_id = None" not in existing:
+            sc.write_text(existing + "\n" + sc_code if existing else sc_code, encoding="utf-8")
+            print(f"[deps] installed Florence-2 compatibility patch in {sc}")
+
+# Scan for any already-cached configuration_florence2.py and patch it directly
+for root in ["/root/.cache", "/workspace/.cache", os.path.expanduser("~/.cache")]:
+    if os.path.isdir(root):
+        for p in Path(root).rglob("configuration_florence2.py"):
+            try:
+                txt = p.read_text(encoding="utf-8")
+                if "if self.forced_bos_token_id is None" in txt:
+                    txt = txt.replace(
+                        "if self.forced_bos_token_id is None",
+                        "if getattr(self, 'forced_bos_token_id', None) is None"
+                    )
+                    p.write_text(txt, encoding="utf-8")
+                    print(f"[deps] patched cached {p}")
+            except Exception:
+                pass
 PY
 
   # 5. Shared model directories & preferences configuration
