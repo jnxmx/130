@@ -1704,6 +1704,15 @@ if [[ -n "${COMFYUI_BACKUP-}" ]]; then
   done
 fi
 
+for settings in \
+    /workspace/ComfyUI/user/default/comfy.settings.json \
+    /Comfy/user/default/comfy.settings.json; do
+  if [[ -f "$settings" ]]; then
+    tmp="${settings}.tmp"
+    jq '."Comfy.Workspace.WorkflowOnLoad" = "empty" | ."Comfy.Workflow.Default" = "empty"' "$settings" > "$tmp" 2>/dev/null && mv "$tmp" "$settings" 2>/dev/null || true
+  fi
+done
+
 # --- Update core + custom nodes when repos change (idempotent) ---
 if [[ -d /workspace/ComfyUI ]]; then
   if [[ "${ENABLE_RUNTIME_REPO_UPDATES:-1}" != "1" ]]; then
