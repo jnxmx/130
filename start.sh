@@ -777,8 +777,8 @@ if not sys_site:
         sys_site = "/usr/local/lib/python3.12/dist-packages"
 
 patterns = [
-    "torch*", "torchvision*", "torchaudio*",
-    "nvidia*", "triton*", "cuda*", "cublas*", "cudnn*"
+    "torch*", "functorch*", "torchvision*", "torchaudio*",
+    "nvidia*", "triton*", "cuda*", "cublas*", "cudnn*", "caffe2*"
 ]
 
 # 1. Clean stale/broken packages or symlinks in target_site that do not match sys_site
@@ -805,6 +805,8 @@ for pat in patterns:
 # 2. Copy .dist-info so uv & pip detect packages as already installed; symlink code directories/files
 copied_dist_info = 0
 linked_pkgs = 0
+top_levels = set()
+
 for pat in patterns:
     for src in glob.glob(os.path.join(sys_site, pat)):
         name = os.path.basename(src)
@@ -814,18 +816,45 @@ for pat in patterns:
                 if os.path.isdir(src):
                     shutil.copytree(src, dst)
                     copied_dist_info += 1
+                record = Path(src) / "RECORD"
+                if record.exists():
+                    for line in record.read_text(encoding="utf-8", errors="ignore").splitlines():
+                        part = line.split(",", 1)[0].split("/")[0].strip()
+                        if part and not part.endswith((".dist-info", ".egg-info")) and part != "..":
+                            top_levels.add(part)
             else:
-                if not dst.exists() and not dst.is_symlink():
-                    dst.symlink_to(src)
-                    linked_pkgs += 1
+                top_levels.add(name)
         except Exception as e:
             print(f"[fizgig][warn] could not link/copy {name}: {e}")
+
+for name in sorted(top_levels):
+    src = Path(sys_site) / name
+    dst = target_site / name
+    if src.exists():
+        if dst.is_symlink():
+            try:
+                target = os.readlink(str(dst))
+                if not target.startswith(sys_site):
+                    dst.unlink(missing_ok=True)
+            except OSError:
+                dst.unlink(missing_ok=True)
+        if not dst.exists() and not dst.is_symlink():
+            try:
+                dst.symlink_to(src)
+                linked_pkgs += 1
+            except Exception as e:
+                print(f"[fizgig][warn] could not link {name}: {e}")
 
 print(f"[fizgig] linked {linked_pkgs} packages and copied {copied_dist_info} dist-info entries from system into isolated venv")
 PY
 
   # 3. Dependencies installation (only if venv created or repo updated or not marked prepared)
-  if [[ "$venv_needed" == "1" || "$old_commit" != "$new_commit" || ! -f "$FIZGIG_DIR/.prepared" || ! -f "$FIZGIG_VENV/.isolated_torch_linked" ]]; then
+  local functorch_present=0
+  for d in "$FIZGIG_VENV"/lib/python*/site-packages/functorch; do
+    if [[ -d "$d" ]]; then functorch_present=1; break; fi
+  done
+
+  if [[ "$venv_needed" == "1" || "$old_commit" != "$new_commit" || ! -f "$FIZGIG_DIR/.prepared" || ! -f "$FIZGIG_VENV/.isolated_torch_linked" || "$functorch_present" != "1" ]]; then
     echo "[fizgig] ensuring pip and uv in venv..." >> /fizgig_setup.log
     "$FIZGIG_VENV/bin/python" -m pip install --upgrade pip uv >> /fizgig_setup.log 2>&1 || true
 
