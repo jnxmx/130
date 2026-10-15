@@ -1187,6 +1187,13 @@ if [[ ! -d /workspace/ComfyUI && -d /Comfy ]]; then
       https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/taew2_1.safetensors \
       -o /Comfy/models/vae_approx/taew2_1.safetensors || true
   fi
+  if [[ ! -f /Comfy/models/vae_approx/taeh3.safetensors ]]; then
+    mkdir -p /Comfy/models/vae_approx
+    echo "Downloading TAE-H3 VAE approx model..."
+    curl -fL --retry 3 \
+      https://raw.githubusercontent.com/madebyollin/taehv/62f7591f59dfbb4c3c02b7a621d180a9eeaba26c/safetensors/taeh3.safetensors \
+      -o /Comfy/models/vae_approx/taeh3.safetensors || true
+  fi
   if [[ ! -f /Comfy/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors ]]; then
     mkdir -p /Comfy/models/latent_upscale_models
     echo "Downloading Minimax H3 Latent Upscaler weights..."
@@ -1202,6 +1209,13 @@ else
   echo "ComfyUI already present in /workspace; skipping copy."
   if [[ "${SYNC_IMAGE_BAKED_COMFY_CORE:-0}" == "1" ]]; then
     sync_image_baked_comfy_core
+  fi
+  if [[ -d /workspace/ComfyUI/models && ! -f /workspace/ComfyUI/models/vae_approx/taeh3.safetensors ]]; then
+    mkdir -p /workspace/ComfyUI/models/vae_approx
+    echo "Downloading TAE-H3 VAE approx model..."
+    curl -fL --retry 3 \
+      https://raw.githubusercontent.com/madebyollin/taehv/62f7591f59dfbb4c3c02b7a621d180a9eeaba26c/safetensors/taeh3.safetensors \
+      -o /workspace/ComfyUI/models/vae_approx/taeh3.safetensors || true
   fi
   if [[ -d /workspace/ComfyUI/models && ! -f /workspace/ComfyUI/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors ]]; then
     mkdir -p /workspace/ComfyUI/models/latent_upscale_models
