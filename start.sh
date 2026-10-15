@@ -669,11 +669,32 @@ start_fizgig_placeholder() {
 
 prepare_fizgig_runtime() {
   set +e
-  echo "[fizgig] setting up in $FIZGIG_DIR" > /fizgig_setup.log
+  local lock_file="/tmp/fizgig_prep.lock"
+  if [[ -f "$lock_file" ]]; then
+    local lock_pid
+    lock_pid="$(cat "$lock_file" 2>/dev/null || echo)"
+    if [[ -n "$lock_pid" && "$lock_pid" != "$$" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+      echo "[fizgig] background preparation is currently running (pid=$lock_pid); waiting for it..." >> /fizgig_setup.log
+      while kill -0 "$lock_pid" 2>/dev/null; do
+        sleep 1
+      done
+      echo "[fizgig] background preparation finished." >> /fizgig_setup.log
+    fi
+  fi
+
+  if [[ -f "/tmp/fizgig_prep.done" && -f "$FIZGIG_DIR/fizgig.py" && -f "$FIZGIG_VENV/bin/python" ]]; then
+    echo "[fizgig] runtime already prepared in this session; skipping redundant prep" >> /fizgig_setup.log
+    return 0
+  fi
+
+  echo "$$" > "$lock_file"
+  echo "[fizgig] setting up in $FIZGIG_DIR" >> /fizgig_setup.log
   mkdir -p "$FIZGIG_DIR" /workspace/datasets /workspace/models /workspace/output_loras /workspace/cache /workspace/profiles
 
   # 1. Clone or update repository from git
+  local old_commit="none"
   if [[ -d "$FIZGIG_DIR/.git" ]]; then
+    old_commit="$(git -C "$FIZGIG_DIR" rev-parse HEAD 2>/dev/null || echo "none")"
     if [[ "${FIZGIG_UPDATE:-0}" == "1" ]]; then
       echo "[fizgig] updating repo to $FIZGIG_REPO_REF from $FIZGIG_REPO_URL" >> /fizgig_setup.log
       git -C "$FIZGIG_DIR" remote set-url origin "$FIZGIG_REPO_URL" >> /fizgig_setup.log 2>&1 || true
@@ -694,34 +715,42 @@ prepare_fizgig_runtime() {
 
   if [[ ! -f "$FIZGIG_DIR/fizgig.py" ]]; then
     echo "[fizgig][error] fizgig.py not found in $FIZGIG_DIR" >> /fizgig_setup.log
+    rm -f "$lock_file" 2>/dev/null || true
     set -e
     return 1
   fi
+  local new_commit="$(git -C "$FIZGIG_DIR" rev-parse HEAD 2>/dev/null || echo "none")"
 
   # 2. Virtual environment setup (isolated venv reusing system CUDA 13 torch)
-  if [[ ! -d "$FIZGIG_VENV" ]]; then
+  local venv_needed=0
+  if [[ ! -d "$FIZGIG_VENV" || ! -f "$FIZGIG_VENV/bin/python" ]]; then
     echo "[fizgig] creating venv with --system-site-packages at $FIZGIG_VENV" >> /fizgig_setup.log
     python3 -m venv "$FIZGIG_VENV" --system-site-packages >> /fizgig_setup.log 2>&1 || true
+    venv_needed=1
   else
     echo "[fizgig] reusing existing venv at $FIZGIG_VENV" >> /fizgig_setup.log
   fi
 
-  # Ensure pip and uv are available in the venv
-  "$FIZGIG_VENV/bin/python" -m pip install --upgrade pip uv >> /fizgig_setup.log 2>&1 || true
+  # 3. Dependencies installation (only if venv created or repo updated or not marked prepared)
+  if [[ "$venv_needed" == "1" || "$old_commit" != "$new_commit" || ! -f "$FIZGIG_DIR/.prepared" ]]; then
+    echo "[fizgig] ensuring pip and uv in venv..." >> /fizgig_setup.log
+    "$FIZGIG_VENV/bin/python" -m pip install --upgrade pip uv >> /fizgig_setup.log 2>&1 || true
 
-  # 3. Dependencies installation (excluding torch binaries to retain base image CUDA 13 PyTorch)
-  if [[ -f "$FIZGIG_DIR/requirements.txt" ]]; then
-    echo "[fizgig] installing requirements (excluding torch binaries to retain base image CUDA 13 PyTorch)" >> /fizgig_setup.log
-    local tmp_req="$FIZGIG_DIR/requirements.no-torch.txt"
-    grep -Ev '^(torch|torchvision|torchaudio)($|[<>=])|--extra-index-url' "$FIZGIG_DIR/requirements.txt" > "$tmp_req" 2>/dev/null || cp "$FIZGIG_DIR/requirements.txt" "$tmp_req"
+    if [[ -f "$FIZGIG_DIR/requirements.txt" ]]; then
+      echo "[fizgig] installing requirements (excluding torch binaries to retain base image CUDA 13 PyTorch)" >> /fizgig_setup.log
+      local tmp_req="$FIZGIG_DIR/requirements.no-torch.txt"
+      grep -Ev '^(torch|torchvision|torchaudio)($|[<>=])|--extra-index-url' "$FIZGIG_DIR/requirements.txt" > "$tmp_req" 2>/dev/null || cp "$FIZGIG_DIR/requirements.txt" "$tmp_req"
 
-    if [[ -f "$FIZGIG_DIR/uv_install_deps.py" ]]; then
-      echo "[fizgig] installing / checking dependencies via uv_install_deps.py..." >> /fizgig_setup.log
-      DISABLE_CUDA=1 "$FIZGIG_VENV/bin/python" "$FIZGIG_DIR/uv_install_deps.py" "$tmp_req" "$FIZGIG_VENV" >> /fizgig_setup.log 2>&1 || true
-    else
-      echo "[fizgig] installing dependencies via uv pip..." >> /fizgig_setup.log
-      DISABLE_CUDA=1 "$FIZGIG_VENV/bin/python" -m uv pip install -r "$tmp_req" >> /fizgig_setup.log 2>&1 || true
+      if [[ -f "$FIZGIG_DIR/uv_install_deps.py" ]]; then
+        echo "[fizgig] installing / checking dependencies via uv_install_deps.py..." >> /fizgig_setup.log
+        DISABLE_CUDA=1 "$FIZGIG_VENV/bin/python" "$FIZGIG_DIR/uv_install_deps.py" "$tmp_req" "$FIZGIG_VENV" >> /fizgig_setup.log 2>&1 || true
+      else
+        echo "[fizgig] installing dependencies via uv pip..." >> /fizgig_setup.log
+        DISABLE_CUDA=1 "$FIZGIG_VENV/bin/python" -m uv pip install -r "$tmp_req" >> /fizgig_setup.log 2>&1 || true
+      fi
     fi
+  else
+    echo "[fizgig] venv and requirements already up to date (${new_commit:0:7})" >> /fizgig_setup.log
   fi
 
   # 4. Patch Fizgig to disable password authentication and allow web access via proxy
@@ -750,6 +779,8 @@ if server_file.is_file():
     # Patch run_server to ensure password is None and local_only is False
     text = text.replace('Handler.password = password or None', 'Handler.password = None')
     text = text.replace('Handler.local_only = not password', 'Handler.local_only = False')
+    if 'a.password = None' not in text:
+        text = text.replace('a = ap.parse_args(argv)', 'a = ap.parse_args(argv)\n    a.password = None')
     server_file.write_text(text, encoding="utf-8")
     print("[fizgig] password authentication and host check disabled in server.py")
 PY
@@ -784,6 +815,7 @@ prefs["lora_output_dir"] = "/workspace/ComfyUI/models/loras"
 prefs["input_dataset_dir"] = "/workspace/datasets"
 prefs["profiles_dir"] = "/workspace/profiles"
 prefs["cache_dir"] = "/workspace/cache"
+prefs["web_password"] = ""
 
 # Model file mappings between Fizgig keys and ComfyUI folders/filenames
 model_map = {
@@ -832,6 +864,10 @@ prefs_file.write_text(json.dumps(prefs, indent=2), encoding="utf-8")
 print("[fizgig] updated prefs.json with ComfyUI shared models and loras output dir")
 PY
 
+  touch "$FIZGIG_DIR/.prepared"
+  touch /tmp/fizgig_prep.done
+  echo "[fizgig] preparation complete and verified." >> /fizgig_setup.log
+  rm -f "$lock_file" 2>/dev/null || true
   set -e
   return 0
 }
@@ -914,8 +950,16 @@ update_comfyui_core() {
 
   local new="$(git rev-parse HEAD 2>/dev/null || echo)"
   if [[ -f requirements.txt ]]; then
-    echo "[deps] Ensuring core requirements are up to date for ${target_dir}..."
-    pip_install_requirements "$VIRTUAL_ENV/bin/python" requirements.txt --upgrade || true
+    if [[ "$old" != "$new" ]]; then
+      if git diff --quiet "$old" "$new" -- requirements.txt 2>/dev/null; then
+        echo "[deps] requirements.txt unchanged in ComfyUI core; skipping reinstall"
+      else
+        echo "[deps] requirements.txt updated in ComfyUI core; installing packages"
+        pip_install_requirements "$VIRTUAL_ENV/bin/python" requirements.txt || true
+      fi
+    else
+      echo "[deps] ComfyUI core is already at commit ${new:0:7}; requirements check skipped"
+    fi
   fi
 }
 
@@ -1746,7 +1790,10 @@ launch_fizgig_runtime() {
   if ! prepare_fizgig_runtime; then
     return 1
   fi
-  stop_placeholder_process FIZGIG_PLACEHOLDER_PID
+  if [[ -n "${FIZGIG_PLACEHOLDER_PID:-}" ]]; then
+    kill "${FIZGIG_PLACEHOLDER_PID}" 2>/dev/null || true
+    sleep 0.5
+  fi
   echo "[fizgig] starting web UI on :$FIZGIG_UI_PORT (PATH prefixed with venv)" >> /fizgig_setup.log
   cd "$FIZGIG_DIR" || return 1
   env -u VNC_PASSWORD -u FIZGIG_PASSWORD \
@@ -1756,6 +1803,8 @@ launch_fizgig_runtime() {
     "$FIZGIG_VENV/bin/python" fizgig.py --web --port "$FIZGIG_UI_PORT" --host 127.0.0.1 >> /fizgig_ui.log 2>&1
 }
 
+export -f placeholder_running
+export -f stop_placeholder_process
 export -f pip_install
 export -f pip_install_requirements
 export -f prepare_fizgig_runtime
@@ -1912,6 +1961,13 @@ CURRENT_MAIN_APP="comfyui"
 set_app_runtime_state "$CURRENT_MAIN_APP" "$CURRENT_MAIN_APP" "booting-comfyui" "ComfyUI is selected as the main app"
 start_fizgig_switch_placeholder || true
 switch_to_app "$CURRENT_MAIN_APP" ""
+
+# If ComfyUI is the active app, prepare Fizgig runtime in the background
+# so it is ready for instantaneous launch when switched.
+if [[ "$CURRENT_MAIN_APP" != "fizgig" ]]; then
+  echo "[fizgig] Triggering background preparation of Fizgig runtime..."
+  prepare_fizgig_runtime &
+fi
 
 while true; do
   desired_app="$(normalize_app_name "$(read_state_value "$APP_DESIRED_FILE" "$CURRENT_MAIN_APP")")"
