@@ -129,7 +129,7 @@ RUN pip install --no-cache-dir -r requirements.txt && \
         ninja 
 
 # Clone and install custom nodes
-ENV CUSTOM_NODES="jnxmx/ComfyUI_HuggingFace_Downloader kijai/ComfyUI-KJNodes Fannovel16/comfyui_controlnet_aux crystian/ComfyUI-Crystools Kosinkadink/ComfyUI-VideoHelperSuite willmiao/ComfyUI-Lora-Manager city96/ComfyUI-GGUF Fannovel16/ComfyUI-Frame-Interpolation lquesada/ComfyUI-Inpaint-CropAndStitch ssitu/ComfyUI_UltimateSDUpscale Comfy-Org/ComfyUI-Manager Comfy-Org/Nvidia_RTX_Nodes_ComfyUI jnxmx/ComfyUI-RunPod-Control"
+ENV CUSTOM_NODES="jnxmx/ComfyUI_HuggingFace_Downloader kijai/ComfyUI-KJNodes Fannovel16/comfyui_controlnet_aux crystian/ComfyUI-Crystools Kosinkadink/ComfyUI-VideoHelperSuite willmiao/ComfyUI-Lora-Manager city96/ComfyUI-GGUF Fannovel16/ComfyUI-Frame-Interpolation lquesada/ComfyUI-Inpaint-CropAndStitch ssitu/ComfyUI_UltimateSDUpscale Comfy-Org/ComfyUI-Manager Comfy-Org/ComfyUI_Nvidia_VFX_Nodes jnxmx/ComfyUI-RunPod-Control xmarre/ComfyUI-Spectrum-MiniMax-H3 LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler"
 WORKDIR /Comfy/custom_nodes
 RUN for repo in $CUSTOM_NODES; do \
     repo_url="https://github.com/$repo.git"; \

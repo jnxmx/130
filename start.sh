@@ -1181,11 +1181,18 @@ cleanup_legacy_manager_settings_dir() {
 # --- First boot: persist ComfyUI into /workspace and fetch taesd ---
 if [[ ! -d /workspace/ComfyUI && -d /Comfy ]]; then
   image_comfy_head="$(current_image_comfy_head)"
-  if [[ ! -f /Comfy/models/checkpoints/taew2_1.safetensors ]]; then
+  if [[ ! -f /Comfy/models/vae_approx/taew2_1.safetensors && ! -f /Comfy/models/checkpoints/taew2_1.safetensors ]]; then
     mkdir -p /Comfy/models/vae_approx
     curl -L \
       https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/taew2_1.safetensors \
-      -o /Comfy/models/vae_approx/taew2_1.safetensors
+      -o /Comfy/models/vae_approx/taew2_1.safetensors || true
+  fi
+  if [[ ! -f /Comfy/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors ]]; then
+    mkdir -p /Comfy/models/latent_upscale_models
+    echo "Downloading Minimax H3 Latent Upscaler weights..."
+    curl -fL --retry 3 \
+      https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/resolve/main/minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors \
+      -o /Comfy/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors || true
   fi
   echo "Persisting ComfyUI to /workspace (first boot)…"
   mv /Comfy /workspace/ComfyUI
@@ -1195,6 +1202,13 @@ else
   echo "ComfyUI already present in /workspace; skipping copy."
   if [[ "${SYNC_IMAGE_BAKED_COMFY_CORE:-0}" == "1" ]]; then
     sync_image_baked_comfy_core
+  fi
+  if [[ -d /workspace/ComfyUI/models && ! -f /workspace/ComfyUI/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors ]]; then
+    mkdir -p /workspace/ComfyUI/models/latent_upscale_models
+    echo "Downloading Minimax H3 Latent Upscaler weights..."
+    curl -fL --retry 3 \
+      https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/resolve/main/minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors \
+      -o /workspace/ComfyUI/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors || true
   fi
 fi
 
