@@ -1,3 +1,5 @@
 /.codex_tmp
 /external_audit/comfy-cli
 /external_audit
+__pycache__/
+*.pyc

@@ -44,13 +44,15 @@ RUN apt update && apt install -y --no-install-recommends \
     libgoogle-perftools4 \
     libtcmalloc-minimal4 \
     nvtop \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    fonts-dejavu-core \
+    fonts-liberation \
+    fontconfig \
  && rm -rf /var/lib/apt/lists/*
-
-# Install Node.js v23.x from nodesource
-RUN curl -fsSL https://deb.nodesource.com/setup_23.x | bash - \
-    && apt-get update \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
 
 # Install uv (faster installer) & JupyterLab
 RUN pip install --no-cache-dir \
@@ -64,40 +66,8 @@ RUN pip install --no-cache-dir \
 # Install FileBrowser
 RUN curl -fsSL https://raw.githubusercontent.com/filebrowser/get/master/get.sh | bash
 
-# --- AI Toolkit (code + isolated venv, linked to system torch) ---
-ENV AITK_DIR=/opt/ai-toolkit
-RUN mkdir -p $AITK_DIR
-WORKDIR $AITK_DIR
-RUN git clone https://github.com/ostris/ai-toolkit.git $AITK_DIR/repo && \
-    cd $AITK_DIR/repo && \
-    git fetch --tags && \
-    latest_tag=$(git tag -l 'v[0-9]*' | sort -V | tail -n 1) && \
-    if [ -n "$latest_tag" ]; then echo "Build-time checking out stable AI-Toolkit tag: $latest_tag" && git checkout -f "$latest_tag"; fi
-
 # Ensure python symlink exists for python3
 RUN ln -sf $(which python3) /usr/local/bin/python || true
-
-RUN python3 -m venv $AITK_DIR/venv && \
-    $AITK_DIR/venv/bin/python -m pip install --upgrade pip wheel setuptools
-
-# Link system torch/cuda packages into AI-Toolkit venv to avoid downloading torch again
-RUN python3 -c 'import site, glob, os; sys_site = site.getsitepackages()[0]; venv_site = "/opt/ai-toolkit/venv/lib/python3.12/site-packages"; [os.symlink(os.path.join(sys_site, p), os.path.join(venv_site, p)) for p in os.listdir(sys_site) if p.startswith(("torch", "caffe2", "nvidia")) and not os.path.exists(os.path.join(venv_site, p))]' || true
-
-# Install AI-Toolkit requirements excluding torch binaries, ensuring torchsde & trampoline are installed
-RUN set -e; \
-    tmp_req="$AITK_DIR/requirements.no-torch.txt"; \
-    if [ -f $AITK_DIR/repo/requirements_base.txt ]; then \
-      grep -Ev '^(torch|torchvision|torchaudio)($|[<>=])' $AITK_DIR/repo/requirements_base.txt > "$tmp_req"; \
-    else \
-      grep -Ev '^(torch|torchvision|torchaudio)($|[<>=])' $AITK_DIR/repo/requirements.txt > "$tmp_req"; \
-    fi; \
-    $AITK_DIR/venv/bin/python -m pip install -r "$tmp_req" scipy==1.12.0 torchsde trampoline || true; \
-    touch $AITK_DIR/.deps_installed
-
-RUN if [ -f $AITK_DIR/repo/ui/package.json ]; then \
-      cd $AITK_DIR/repo/ui && npm install --include=dev && npm rebuild sqlite3 --build-from-source && npm run update_db && npm run build && \
-      touch $AITK_DIR/.ui_built; \
-    fi
     
 # Set up ComfyUI
 RUN mkdir -p /Comfy
@@ -205,7 +175,6 @@ RUN dos2unix /start.sh && chmod +x /start.sh \
  && find /scripts -type f -name "*.sh" -exec dos2unix {} \; -exec chmod +x {} \;
 
 
-## AI Toolkit will be bootstrapped at runtime by start.sh
 WORKDIR /workspace
 
 # Set environment variables
@@ -220,8 +189,9 @@ ENV HF_HOME="/workspace/.cache/huggingface" \
     UV_CACHE_DIR="/workspace/.cache/uv/" \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     TRANSFORMERS_CACHE="/workspace/.cache/huggingface/transformers" \
-    AI_TOOLKIT_AUTH="password" \
-    NIGHTLY_COMFYUI=0 \
-    NODE_ENV=production
+    INSIGHTFACE_HOME="/workspace/.insightface" \
+    FIZGIG_HOME="/workspace" \
+    FIZGIG_POD=1 \
+    NIGHTLY_COMFYUI=0
 
 CMD ["/start.sh"]

@@ -374,8 +374,11 @@ write_state_value() {
 normalize_app_name() {
   local app_name="${1:-}"
   case "$app_name" in
-    comfyui|ai-toolkit)
+    comfyui|fizgig)
       printf '%s\n' "$app_name"
+      ;;
+    ai-toolkit)
+      printf 'fizgig\n'
       ;;
     *)
       printf 'comfyui\n'
@@ -441,7 +444,7 @@ start_comfy_switch_placeholder() {
     --port "$port" \
     --state-dir "$APP_STATE_DIR" \
     --target-app comfyui \
-    --source-app ai-toolkit \
+    --source-app fizgig \
     >> /placeholder.log 2>&1 &
   export COMFY_PLACEHOLDER_PID=$!
   sleep 0.2
@@ -614,221 +617,221 @@ fi
 
 mkdir -p /workspace
 
-# --- AI Toolkit isolated install/update + UI ---
-AITK_DIR="${AITK_DIR:-/opt/ai-toolkit}"
-AITK_REPO_DIR="${AITK_REPO_DIR:-$AITK_DIR/repo}"
-AITK_VENV="${AITK_VENV:-$AITK_DIR/venv}"
-AITK_DATA_DIR="${AITK_DATA_DIR:-/workspace/ai-toolkit}"
-AITK_REPO_URL="${AITK_REPO_URL:-https://github.com/ostris/ai-toolkit.git}"
-AITK_UI_PORT="${AITK_UI_PORT:-8675}"
-AITK_UPDATE="${AITK_UPDATE:-1}"
+# --- Fizgig LoRA & Fine-tune Studio ---
+FIZGIG_DIR="${FIZGIG_DIR:-/workspace/Fizgig}"
+FIZGIG_REPO_URL="${FIZGIG_REPO_URL:-https://github.com/shootthesound/Fizgig.git}"
+FIZGIG_REPO_REF="${FIZGIG_REPO_REF:-master}"
+FIZGIG_VENV="${FIZGIG_VENV:-$FIZGIG_DIR/venv}"
+FIZGIG_UI_PORT="${FIZGIG_UI_PORT:-8081}"
+FIZGIG_UPDATE="${FIZGIG_UPDATE:-1}"
+FIZGIG_APP_PID=""
 
-# Temporary log page on AI Toolkit port until UI starts
-start_ai_toolkit_startup_placeholder() {
-  if placeholder_running "${AITK_PLACEHOLDER_PID:-}"; then
+# Temporary log page on Fizgig port until UI starts
+start_fizgig_startup_placeholder() {
+  if placeholder_running "${FIZGIG_PLACEHOLDER_PID:-}"; then
     return 0
   fi
-  /usr/bin/env python3 /scripts/ai_toolkit_wait_page.py \
-    --port "$AITK_UI_PORT" --refresh 2 \
-    --files /ai_toolkit_setup.log \
-    >> /aitk_placeholder.log 2>&1 &
-  export AITK_PLACEHOLDER_PID=$!
+  /usr/bin/env python3 /scripts/fizgig_wait_page.py \
+    --port "$FIZGIG_UI_PORT" \
+    --files /fizgig_setup.log \
+    >> /fizgig_placeholder.log 2>&1 &
+  export FIZGIG_PLACEHOLDER_PID=$!
   sleep 0.2
-  if ! placeholder_running "${AITK_PLACEHOLDER_PID:-}"; then
-    echo "[aitk placeholder][error] failed to start on :$AITK_UI_PORT" >> /ai_toolkit_setup.log
+  if ! placeholder_running "${FIZGIG_PLACEHOLDER_PID:-}"; then
+    echo "[fizgig placeholder][error] failed to start on :$FIZGIG_UI_PORT" >> /fizgig_setup.log
     return 1
   fi
-  echo "[aitk placeholder] started on :$AITK_UI_PORT (pid=$AITK_PLACEHOLDER_PID)" >> /ai_toolkit_setup.log
+  echo "[fizgig placeholder] started on :$FIZGIG_UI_PORT (pid=$FIZGIG_PLACEHOLDER_PID)" >> /fizgig_setup.log
 }
 
-start_ai_toolkit_switch_placeholder() {
-  if placeholder_running "${AITK_PLACEHOLDER_PID:-}"; then
+start_fizgig_switch_placeholder() {
+  if placeholder_running "${FIZGIG_PLACEHOLDER_PID:-}"; then
     return 0
   fi
   /usr/bin/env python3 /scripts/app_switch_page.py \
-    --port "$AITK_UI_PORT" \
+    --port "$FIZGIG_UI_PORT" \
     --state-dir "$APP_STATE_DIR" \
-    --target-app ai-toolkit \
+    --target-app fizgig \
     --source-app comfyui \
-    >> /aitk_placeholder.log 2>&1 &
-  export AITK_PLACEHOLDER_PID=$!
+    >> /fizgig_placeholder.log 2>&1 &
+  export FIZGIG_PLACEHOLDER_PID=$!
   sleep 0.2
-  if ! placeholder_running "${AITK_PLACEHOLDER_PID:-}"; then
-    echo "[aitk placeholder][error] failed to start switch page on :$AITK_UI_PORT" >> /ai_toolkit_setup.log
+  if ! placeholder_running "${FIZGIG_PLACEHOLDER_PID:-}"; then
+    echo "[fizgig placeholder][error] failed to start switch page on :$FIZGIG_UI_PORT" >> /fizgig_setup.log
     return 1
   fi
-  echo "[aitk placeholder] switch page started on :$AITK_UI_PORT (pid=$AITK_PLACEHOLDER_PID)" >> /ai_toolkit_setup.log
+  echo "[fizgig placeholder] switch page started on :$FIZGIG_UI_PORT (pid=$FIZGIG_PLACEHOLDER_PID)" >> /fizgig_setup.log
 }
 
-start_ai_toolkit_placeholder() {
-  start_ai_toolkit_startup_placeholder "$@"
+start_fizgig_placeholder() {
+  start_fizgig_startup_placeholder "$@"
 }
 
-prepare_ai_toolkit_data_dirs() {
-  mkdir -p "$AITK_DATA_DIR" "$AITK_DATA_DIR/datasets" "$AITK_DATA_DIR/output" "$AITK_DATA_DIR/data"
-  if [[ -d "$AITK_REPO_DIR" ]]; then
-    for name in output datasets data; do
-      target="$AITK_REPO_DIR/$name"
-      link="$AITK_DATA_DIR/$name"
-      if [[ -e "$target" && ! -L "$target" ]]; then
-        rm -rf "$target"
-      fi
-      ln -sfn "$link" "$target"
-    done
-    db_target="$AITK_DATA_DIR/aitk_db.db"
-    db_link="$AITK_REPO_DIR/aitk_db.db"
-    if [[ -f "$db_link" && ! -L "$db_link" ]]; then
-      mv "$db_link" "$db_target" 2>/dev/null || true
-    fi
-    ln -sfn "$db_target" "$db_link"
-  fi
-}
-
-ensure_ai_toolkit_settings() {
-  local db="$AITK_DATA_DIR/aitk_db.db"
-  if [[ ! -f "$db" ]]; then
-    return 0
-  fi
-  AITK_DB="$db" \
-  AITK_TRAINING_FOLDER="$AITK_DATA_DIR/output" \
-  AITK_DATASETS_FOLDER="$AITK_DATA_DIR/datasets" \
-  AITK_DATA_ROOT="$AITK_DATA_DIR/data" \
-  python3 - <<'PY'
-import os
-import sqlite3
-
-db = os.environ["AITK_DB"]
-conn = sqlite3.connect(db)
-cur = conn.cursor()
-cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='Settings'")
-if not cur.fetchone():
-    conn.close()
-    raise SystemExit(0)
-
-settings = [
-    ("TRAINING_FOLDER", os.environ["AITK_TRAINING_FOLDER"]),
-    ("DATASETS_FOLDER", os.environ["AITK_DATASETS_FOLDER"]),
-    ("DATA_ROOT", os.environ["AITK_DATA_ROOT"]),
-]
-for key, value in settings:
-    cur.execute("INSERT OR REPLACE INTO Settings(key, value) VALUES (?, ?)", (key, value))
-conn.commit()
-conn.close()
-PY
-}
-
-prepare_ai_toolkit_runtime() {
+prepare_fizgig_runtime() {
   set +e
-  local pip_constraint="/etc/pip/constraints.txt"
-  echo "[ai-toolkit] setting up in $AITK_DIR" > /ai_toolkit_setup.log
-  mkdir -p "$AITK_DIR"
+  echo "[fizgig] setting up in $FIZGIG_DIR" > /fizgig_setup.log
+  mkdir -p "$FIZGIG_DIR" /workspace/datasets /workspace/models /workspace/output_loras /workspace/cache /workspace/profiles
 
-  if [[ ! -d "$AITK_REPO_DIR/.git" ]]; then
-    echo "[ai-toolkit] cloning repo." >> /ai_toolkit_setup.log
-    git clone "$AITK_REPO_URL" "$AITK_REPO_DIR" >> /ai_toolkit_setup.log 2>&1 || true
-    latest_tag=$(git -C "$AITK_REPO_DIR" tag -l 'v[0-9]*' | sort -V | tail -n 1)
-    if [[ -n "$latest_tag" ]]; then
-      echo "[ai-toolkit] checking out stable tag: $latest_tag" >> /ai_toolkit_setup.log
-      git -C "$AITK_REPO_DIR" checkout -f "$latest_tag" >> /ai_toolkit_setup.log 2>&1 || true
-    fi
-  elif [[ "${AITK_UPDATE:-0}" == "1" ]]; then
-    echo "[ai-toolkit] updating repo to latest stable tag." >> /ai_toolkit_setup.log
-    git -C "$AITK_REPO_DIR" fetch --tags >> /ai_toolkit_setup.log 2>&1 || true
-    latest_tag=$(git -C "$AITK_REPO_DIR" tag -l 'v[0-9]*' | sort -V | tail -n 1)
-    if [[ -n "$latest_tag" ]]; then
-      git -C "$AITK_REPO_DIR" checkout -f "$latest_tag" >> /ai_toolkit_setup.log 2>&1 || true
-    else
-      git -C "$AITK_REPO_DIR" pull --ff-only >> /ai_toolkit_setup.log 2>&1 || true
-    fi
-  fi
-
-  prepare_ai_toolkit_data_dirs
-
-  deps_marker="$AITK_DIR/.deps_installed"
-  if [[ ! -d "$AITK_VENV" ]]; then
-    echo "[ai-toolkit] creating venv at $AITK_VENV" >> /ai_toolkit_setup.log
-    python3 -m venv "$AITK_VENV" >> /ai_toolkit_setup.log 2>&1 || true
-    rm -f "$deps_marker"
-  fi
-
-  if [[ ! -f "$deps_marker" ]]; then
-    if [[ -f "$pip_constraint" ]]; then
-      PIP_CONSTRAINT="$pip_constraint" pip_install "$AITK_VENV/bin/python" --upgrade pip wheel setuptools >> /ai_toolkit_setup.log 2>&1 || true
-    else
-      pip_install "$AITK_VENV/bin/python" --upgrade pip wheel setuptools >> /ai_toolkit_setup.log 2>&1 || true
-    fi
-    torch_marker="$AITK_DIR/.torch_installed"
-    AITK_TORCH_INDEX_URL="${AITK_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu130}"
-    torch_ok=0
-    if "$AITK_VENV/bin/python" -c "import torch, torchvision, torchaudio" >/dev/null 2>&1; then
-      torch_ok=1
-    fi
-    sys_torch_versions="$(python3 -c "import torch, torchvision, torchaudio; print(torch.__version__); print(torchvision.__version__); print(torchaudio.__version__)" 2>/dev/null)" || sys_torch_versions=""
-    sys_torch_ver=""
-    sys_torchvision_ver=""
-    sys_torchaudio_ver=""
-    if [[ -n "$sys_torch_versions" ]]; then
-      IFS=$'\n' read -r sys_torch_ver sys_torchvision_ver sys_torchaudio_ver <<< "$sys_torch_versions"
-    fi
-    desired_torch_spec="${sys_torch_ver}|${sys_torchvision_ver}|${sys_torchaudio_ver}"
-    if [[ "$torch_ok" -ne 1 ]] || [[ -z "$sys_torch_ver" ]] || [[ -z "$sys_torchvision_ver" ]] || [[ -z "$sys_torchaudio_ver" ]] || [[ ! -f "$torch_marker" ]] || [[ "$(cat "$torch_marker")" != "$desired_torch_spec" ]]; then
-      if [[ -n "$sys_torch_ver" && -n "$sys_torchvision_ver" && -n "$sys_torchaudio_ver" ]]; then
-        echo "[ai-toolkit] installing torch ${desired_torch_spec}" >> /ai_toolkit_setup.log
-        pip_install "$AITK_VENV/bin/python" --index-url "$AITK_TORCH_INDEX_URL" \
-          "torch==${sys_torch_ver}" "torchvision==${sys_torchvision_ver}" "torchaudio==${sys_torchaudio_ver}" \
-          >> /ai_toolkit_setup.log 2>&1 || true
-        echo "$desired_torch_spec" > "$torch_marker"
-      else
-        echo "[ai-toolkit][warn] system torch versions unknown; installing latest torch from index" >> /ai_toolkit_setup.log
-        pip_install "$AITK_VENV/bin/python" --index-url "$AITK_TORCH_INDEX_URL" torch torchvision torchaudio \
-          >> /ai_toolkit_setup.log 2>&1 || true
+  # 1. Clone or update repository from git
+  if [[ -d "$FIZGIG_DIR/.git" ]]; then
+    if [[ "${FIZGIG_UPDATE:-0}" == "1" ]]; then
+      echo "[fizgig] updating repo to $FIZGIG_REPO_REF from $FIZGIG_REPO_URL" >> /fizgig_setup.log
+      git -C "$FIZGIG_DIR" remote set-url origin "$FIZGIG_REPO_URL" >> /fizgig_setup.log 2>&1 || true
+      if ! git -C "$FIZGIG_DIR" fetch --depth 1 origin "$FIZGIG_REPO_REF" >> /fizgig_setup.log 2>&1 \
+         || ! git -C "$FIZGIG_DIR" reset --hard FETCH_HEAD >> /fizgig_setup.log 2>&1; then
+        echo "[fizgig][warn] git update failed (possible volume corruption); attempting clean re-clone" >> /fizgig_setup.log
+        rm -rf "$FIZGIG_DIR.broken" 2>/dev/null || true
+        mv "$FIZGIG_DIR" "$FIZGIG_DIR.broken" 2>/dev/null || true
+        git clone --depth 1 --branch "$FIZGIG_REPO_REF" "$FIZGIG_REPO_URL" "$FIZGIG_DIR" >> /fizgig_setup.log 2>&1 || true
       fi
+    else
+      echo "[fizgig] update disabled; keeping current checkout" >> /fizgig_setup.log
     fi
-
-    if [[ -f "$AITK_REPO_DIR/requirements.txt" ]]; then
-      echo "[ai-toolkit] installing requirements (excluding torch/vision/audio to keep your version)." >> /ai_toolkit_setup.log
-      tmp_req="$AITK_DIR/requirements.no-torch.txt"
-      grep -Ev '^(torch|torchvision|torchaudio)($|[<>=])' "$AITK_REPO_DIR/requirements.txt" > "$tmp_req" || cp "$AITK_REPO_DIR/requirements.txt" "$tmp_req"
-      if [[ -f "$pip_constraint" ]]; then
-        PIP_CONSTRAINT="$pip_constraint" pip_install_requirements "$AITK_VENV/bin/python" "$tmp_req" >> /ai_toolkit_setup.log 2>&1 || true
-        PIP_CONSTRAINT="$pip_constraint" pip_install "$AITK_VENV/bin/python" torchsde trampoline >> /ai_toolkit_setup.log 2>&1 || true
-      else
-        pip_install_requirements "$AITK_VENV/bin/python" "$tmp_req" >> /ai_toolkit_setup.log 2>&1 || true
-        pip_install "$AITK_VENV/bin/python" torchsde trampoline >> /ai_toolkit_setup.log 2>&1 || true
-      fi
-    fi
-
-    touch "$deps_marker"
   else
-    echo "[ai-toolkit] deps already installed; skipping" >> /ai_toolkit_setup.log
+    echo "[fizgig] cloning repo ($FIZGIG_REPO_REF) from $FIZGIG_REPO_URL" >> /fizgig_setup.log
+    git clone --depth 1 --branch "$FIZGIG_REPO_REF" "$FIZGIG_REPO_URL" "$FIZGIG_DIR" >> /fizgig_setup.log 2>&1 || true
   fi
-  if ! "$AITK_VENV/bin/python" -c "import mediapipe as mp; raise SystemExit(0 if hasattr(mp, 'solutions') else 1)" >/dev/null 2>&1; then
-    echo "[ai-toolkit][warn] mediapipe missing solutions; patching controlnet_aux" >> /ai_toolkit_setup.log
-    "$AITK_VENV/bin/python" -c $'import site\nfrom pathlib import Path\nfor base in site.getsitepackages():\n    path = Path(base) / "controlnet_aux" / "__init__.py"\n    if not path.is_file():\n        continue\n    text = path.read_text(encoding="utf-8")\n    if "skip mediapipe when unavailable" in text:\n        break\n    target = "from .mediapipe_face import MediapipeFaceDetector"\n    if target in text:\n        replacement = (\n            "try:\\n"\n            "    from .mediapipe_face import MediapipeFaceDetector\\n"\n            "except Exception:\\n"\n            "    MediapipeFaceDetector = None  # skip mediapipe when unavailable\\n"\n        )\n        text = text.replace(target, replacement)\n        path.write_text(text, encoding="utf-8")\n    break\n'
-  fi
-  # Build and run UI (Node)
-  if [[ -f "$AITK_REPO_DIR/ui/package.json" ]]; then
-    local ui_dir="$AITK_REPO_DIR/ui"
-    if [[ ! -d "$ui_dir/node_modules" ]]; then
-      echo "[ai-toolkit] installing UI dependencies (incl. dev) ..." >> /ai_toolkit_setup.log
-      (cd "$ui_dir" && npm install --include=dev >> /ai_toolkit_setup.log 2>&1)
-    fi
-    local db_path="$AITK_DATA_DIR/aitk_db.db"
-    if [[ ! -f "$db_path" || "${AITK_FORCE_DB_UPDATE:-0}" == "1" ]]; then
-      echo "[ai-toolkit] updating DB (prisma) ..." >> /ai_toolkit_setup.log
-      (cd "$ui_dir" && npm run update_db >> /ai_toolkit_setup.log 2>&1)
-    fi
-    if [[ ! -d "$ui_dir/.next" ]]; then
-      echo "[ai-toolkit] building UI..." >> /ai_toolkit_setup.log
-      (cd "$ui_dir" && npm run build >> /ai_toolkit_setup.log 2>&1)
-    fi
-    ensure_ai_toolkit_settings
-  else
-    echo "[ai-toolkit] ui/package.json not found; skipping UI start" >> /ai_toolkit_setup.log
+
+  if [[ ! -f "$FIZGIG_DIR/fizgig.py" ]]; then
+    echo "[fizgig][error] fizgig.py not found in $FIZGIG_DIR" >> /fizgig_setup.log
     set -e
     return 1
   fi
-  # restore -e for the rest of the script
+
+  # 2. Virtual environment setup (isolated venv reusing system CUDA 13 torch)
+  if [[ ! -d "$FIZGIG_VENV" ]]; then
+    echo "[fizgig] creating venv with --system-site-packages at $FIZGIG_VENV" >> /fizgig_setup.log
+    python3 -m venv "$FIZGIG_VENV" --system-site-packages >> /fizgig_setup.log 2>&1 || true
+  else
+    echo "[fizgig] reusing existing venv at $FIZGIG_VENV" >> /fizgig_setup.log
+  fi
+
+  # Ensure pip and uv are available in the venv
+  "$FIZGIG_VENV/bin/python" -m pip install --upgrade pip uv >> /fizgig_setup.log 2>&1 || true
+
+  # 3. Dependencies installation (excluding torch binaries to retain base image CUDA 13 PyTorch)
+  if [[ -f "$FIZGIG_DIR/requirements.txt" ]]; then
+    echo "[fizgig] installing requirements (excluding torch binaries to retain base image CUDA 13 PyTorch)" >> /fizgig_setup.log
+    local tmp_req="$FIZGIG_DIR/requirements.no-torch.txt"
+    grep -Ev '^(torch|torchvision|torchaudio)($|[<>=])|--extra-index-url' "$FIZGIG_DIR/requirements.txt" > "$tmp_req" 2>/dev/null || cp "$FIZGIG_DIR/requirements.txt" "$tmp_req"
+
+    if [[ -f "$FIZGIG_DIR/uv_install_deps.py" ]]; then
+      echo "[fizgig] installing / checking dependencies via uv_install_deps.py..." >> /fizgig_setup.log
+      DISABLE_CUDA=1 "$FIZGIG_VENV/bin/python" "$FIZGIG_DIR/uv_install_deps.py" "$tmp_req" "$FIZGIG_VENV" >> /fizgig_setup.log 2>&1 || true
+    else
+      echo "[fizgig] installing dependencies via uv pip..." >> /fizgig_setup.log
+      DISABLE_CUDA=1 "$FIZGIG_VENV/bin/python" -m uv pip install -r "$tmp_req" >> /fizgig_setup.log 2>&1 || true
+    fi
+  fi
+
+  # 4. Patch Fizgig to disable password authentication and allow web access via proxy
+  FIZGIG_DIR="$FIZGIG_DIR" python3 - <<'PY' >> /fizgig_setup.log 2>&1
+import os, re
+from pathlib import Path
+
+fizgig_dir = os.environ.get("FIZGIG_DIR", "/workspace/Fizgig")
+server_file = Path(fizgig_dir) / "src" / "fizgig" / "web" / "server.py"
+if server_file.is_file():
+    text = server_file.read_text(encoding="utf-8")
+    # Patch _logged_in to always return True
+    text = re.sub(
+        r'def _logged_in\(self\):.*?(?=\n    def )',
+        'def _logged_in(self):\n        return True\n',
+        text,
+        flags=re.DOTALL
+    )
+    # Patch _host_ok to always return True
+    text = re.sub(
+        r'def _host_ok\(self\):.*?(?=\n    def )',
+        'def _host_ok(self):\n        return True\n',
+        text,
+        flags=re.DOTALL
+    )
+    # Patch run_server to ensure password is None and local_only is False
+    text = text.replace('Handler.password = password or None', 'Handler.password = None')
+    text = text.replace('Handler.local_only = not password', 'Handler.local_only = False')
+    server_file.write_text(text, encoding="utf-8")
+    print("[fizgig] password authentication and host check disabled in server.py")
+PY
+
+  # 5. Shared model directories & preferences configuration
+  echo "[fizgig] configuring shared models with ComfyUI..." >> /fizgig_setup.log
+  mkdir -p "$FIZGIG_DIR/user_data"
+  # Symlink user_data/models to /workspace/models
+  if [[ ! -L "$FIZGIG_DIR/user_data/models" ]]; then
+    rm -rf "$FIZGIG_DIR/user_data/models" 2>/dev/null || true
+    ln -s /workspace/models "$FIZGIG_DIR/user_data/models" 2>/dev/null || true
+  fi
+
+  # Configure prefs.json to link ComfyUI model directories and output LoRAs
+  FIZGIG_DIR="$FIZGIG_DIR" python3 - <<'PY' >> /fizgig_setup.log 2>&1
+import json, os
+from pathlib import Path
+
+fizgig_dir = Path(os.environ.get("FIZGIG_DIR", "/workspace/Fizgig"))
+prefs_file = fizgig_dir / "user_data" / "prefs.json"
+prefs_file.parent.mkdir(parents=True, exist_ok=True)
+
+prefs = {}
+if prefs_file.is_file():
+    try:
+        prefs = json.loads(prefs_file.read_text(encoding="utf-8"))
+    except Exception:
+        prefs = {}
+
+# Set shared output directory to ComfyUI LoRAs
+prefs["lora_output_dir"] = "/workspace/ComfyUI/models/loras"
+prefs["input_dataset_dir"] = "/workspace/datasets"
+prefs["profiles_dir"] = "/workspace/profiles"
+prefs["cache_dir"] = "/workspace/cache"
+
+# Model file mappings between Fizgig keys and ComfyUI folders/filenames
+model_map = {
+    "minimax_dit": ("diffusion_models", "minimax_h3_fl2va_pruned_int8_convrot.safetensors"),
+    "minimax_ref_dit": ("diffusion_models", "minimax_h3_ref2va_pruned_int8_convrot.safetensors"),
+    "minimax_text_encoder": ("text_encoders", "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"),
+    "minimax_vae": ("vae", "minimax_h3_video_vae_fp16.safetensors"),
+    "minimax_audio_vae": ("vae", "minimax_h3_audio_vae_fp32.safetensors"),
+    "minimax_turbo_lora": ("loras", "minimax_h3_turbo_v4_step600.safetensors"),
+    "minimax_circlestone_adapter": ("loras", "minimax_h3_image_training_adapter.safetensors"),
+    "minimax_training_adapter": ("loras", "minimax_h3_training_adapter_v1.safetensors"),
+    "minimax_ref_training_adapter": ("loras", "minimax_h3_ref2va_training_adapter_v1.safetensors"),
+    "krea2_text_encoder": ("text_encoders", "qwen3vl_4b_fp8_scaled.safetensors"),
+    "base_dit": ("diffusion_models", "flux-2-klein-base-9b-fp8.safetensors"),
+    "distilled_dit": ("diffusion_models", "flux-2-klein-9b-fp8.safetensors"),
+    "text_encoder": ("text_encoders", "qwen_3_8b.safetensors"),
+    "vae": ("vae", "ae.safetensors"),
+}
+
+search_roots = [
+    Path("/workspace/ComfyUI/models"),
+    Path("/Comfy/models"),
+    Path("/workspace/models"),
+]
+
+for key, (subfolder, filename) in model_map.items():
+    current_val = prefs.get(key)
+    if current_val and os.path.isfile(current_val):
+        continue
+    found_path = None
+    for root in search_roots:
+        candidate = root / subfolder / filename
+        if candidate.is_file():
+            found_path = str(candidate)
+            break
+        candidate_flat = root / filename
+        if candidate_flat.is_file():
+            found_path = str(candidate_flat)
+            break
+    if found_path:
+        prefs[key] = found_path
+    elif not prefs.get(key):
+        prefs[key] = f"/workspace/ComfyUI/models/{subfolder}/{filename}"
+
+prefs_file.write_text(json.dumps(prefs, indent=2), encoding="utf-8")
+print("[fizgig] updated prefs.json with ComfyUI shared models and loras output dir")
+PY
+
   set -e
   return 0
 }
@@ -1600,7 +1603,7 @@ fi
 
 # --- Main app supervision / switching ---
 COMFY_APP_PID=""
-AITK_APP_PID=""
+FIZGIG_APP_PID=""
 
 process_running() {
   local pid="${1:-}"
@@ -1739,34 +1742,25 @@ launch_comfyui_runtime() {
   PIP_NO_COMPILE=1 COMFYUI_ALLOWED_HOSTS="*" COMFYUI_CORS_ALLOWED_ORIGINS="*" "$VIRTUAL_ENV/bin/python" main.py "${comfy_args[@]}"
 }
 
-launch_ai_toolkit_runtime() {
-  if ! prepare_ai_toolkit_runtime; then
+launch_fizgig_runtime() {
+  if ! prepare_fizgig_runtime; then
     return 1
   fi
-  if [[ -n "${AITK_PLACEHOLDER_PID:-}" ]]; then
-    kill "${AITK_PLACEHOLDER_PID}" 2>/dev/null || true
-    sleep 0.5
-  fi
-  local ui_dir="$AITK_REPO_DIR/ui"
-  echo "[ai-toolkit] starting UI on :$AITK_UI_PORT (PATH prefixed with venv)" >> /ai_toolkit_setup.log
-  cd "$ui_dir" || return 1
-  # Use npm run start but override concurrently's infinite restart with --restart-tries 0
-  # This prevents ai-toolkit from auto-respawning when killed
-  env \
-    PATH="$AITK_VENV/bin:$PATH" \
-    VIRTUAL_ENV="$AITK_VENV" \
-    PYTHON="$AITK_VENV/bin/python" \
-    PORT="$AITK_UI_PORT" \
-    npx concurrently --restart-tries 0 -n WORKER,UI "node dist/cron/worker.js" "next start --port $AITK_UI_PORT" >> /ai_toolkit_ui.log 2>&1
+  stop_placeholder_process FIZGIG_PLACEHOLDER_PID
+  echo "[fizgig] starting web UI on :$FIZGIG_UI_PORT (PATH prefixed with venv)" >> /fizgig_setup.log
+  cd "$FIZGIG_DIR" || return 1
+  env -u VNC_PASSWORD -u FIZGIG_PASSWORD \
+    PATH="$FIZGIG_VENV/bin:$PATH" \
+    VIRTUAL_ENV="$FIZGIG_VENV" \
+    PYTHON="$FIZGIG_VENV/bin/python" \
+    "$FIZGIG_VENV/bin/python" fizgig.py --web --port "$FIZGIG_UI_PORT" --host 127.0.0.1 >> /fizgig_ui.log 2>&1
 }
 
 export -f pip_install
 export -f pip_install_requirements
-export -f prepare_ai_toolkit_data_dirs
-export -f ensure_ai_toolkit_settings
-export -f prepare_ai_toolkit_runtime
+export -f prepare_fizgig_runtime
 export -f launch_comfyui_runtime
-export -f launch_ai_toolkit_runtime
+export -f launch_fizgig_runtime
 export CPU_CONFIRM_REQUIRED
 export CPU_CONTINUE_FILE
 export CPU_WAIT_PORT
@@ -1774,13 +1768,12 @@ export CPU_PIN_CANDIDATE
 export VIRTUAL_ENV
 export NEW_MANAGER
 export DISABLE_PM
-export AITK_DIR
-export AITK_REPO_DIR
-export AITK_VENV
-export AITK_DATA_DIR
-export AITK_REPO_URL
-export AITK_UI_PORT
-export AITK_UPDATE
+export FIZGIG_DIR
+export FIZGIG_REPO_URL
+export FIZGIG_REPO_REF
+export FIZGIG_VENV
+export FIZGIG_UI_PORT
+export FIZGIG_UPDATE
 export APP_STATE_DIR
 export NIGHTLY_COMFYUI
 
@@ -1811,18 +1804,18 @@ start_comfy_app_process() {
   fi
 }
 
-start_ai_toolkit_app_process() {
-  stop_placeholder_process AITK_PLACEHOLDER_PID
-  start_ai_toolkit_startup_placeholder || true
+start_fizgig_app_process() {
+  stop_placeholder_process FIZGIG_PLACEHOLDER_PID
+  start_fizgig_startup_placeholder || true
   ensure_nginx_started || true
-  export AITK_PLACEHOLDER_PID
-  spawn_app_session 'launch_ai_toolkit_runtime'
-  AITK_APP_PID=$!
-  echo "[ai-toolkit] supervisor child started (pid=$AITK_APP_PID)"
+  export FIZGIG_PLACEHOLDER_PID
+  spawn_app_session 'launch_fizgig_runtime'
+  FIZGIG_APP_PID=$!
+  echo "[fizgig] supervisor child started (pid=$FIZGIG_APP_PID)"
   # brief check: if the process exits immediately, sleep to avoid fast respawn loops
   sleep 2
-  if ! process_running "${AITK_APP_PID:-}"; then
-    echo "[ai-toolkit][warn] aitk process exited immediately; backing off before restart" >> /ai_toolkit_setup.log 2>&1 || true
+  if ! process_running "${FIZGIG_APP_PID:-}"; then
+    echo "[fizgig][warn] fizgig process exited immediately; backing off before restart" >> /fizgig_setup.log 2>&1 || true
     sleep 5
   fi
 }
@@ -1833,8 +1826,8 @@ active_app_placeholder_running() {
     comfyui)
       placeholder_running "${COMFY_PLACEHOLDER_PID:-}"
       ;;
-    ai-toolkit)
-      placeholder_running "${AITK_PLACEHOLDER_PID:-}"
+    fizgig)
+      placeholder_running "${FIZGIG_PLACEHOLDER_PID:-}"
       ;;
     *)
       return 1
@@ -1847,7 +1840,7 @@ ensure_selected_app_running() {
   selected_app="$(normalize_app_name "$1")"
   case "$selected_app" in
     comfyui)
-      start_ai_toolkit_switch_placeholder || true
+      start_fizgig_switch_placeholder || true
       if process_running "${COMFY_APP_PID:-}"; then
         if active_app_placeholder_running "$selected_app"; then
           set_app_runtime_state "comfyui" "comfyui" "starting-comfyui" "Starting ComfyUI"
@@ -1859,18 +1852,18 @@ ensure_selected_app_running() {
       set_app_runtime_state "comfyui" "comfyui" "starting-comfyui" "Starting ComfyUI"
       start_comfy_app_process
       ;;
-    ai-toolkit)
+    fizgig)
       start_comfy_switch_placeholder || true
-      if process_running "${AITK_APP_PID:-}"; then
+      if process_running "${FIZGIG_APP_PID:-}"; then
         if active_app_placeholder_running "$selected_app"; then
-          set_app_runtime_state "ai-toolkit" "ai-toolkit" "starting-ai-toolkit" "Starting AI Toolkit"
+          set_app_runtime_state "fizgig" "fizgig" "starting-fizgig" "Starting Fizgig"
         else
-          set_app_runtime_state "ai-toolkit" "ai-toolkit" "running" "AI Toolkit is the main app on :8675"
+          set_app_runtime_state "fizgig" "fizgig" "running" "Fizgig is the main app on :8081"
         fi
         return 0
       fi
-      set_app_runtime_state "ai-toolkit" "ai-toolkit" "starting-ai-toolkit" "Starting AI Toolkit"
-      start_ai_toolkit_app_process
+      set_app_runtime_state "fizgig" "fizgig" "starting-fizgig" "Starting Fizgig"
+      start_fizgig_app_process
       ;;
   esac
 }
@@ -1888,18 +1881,18 @@ switch_to_app() {
 
   case "$current_app" in
     comfyui)
-      set_app_runtime_state "comfyui" "$target_app" "stopping-comfyui" "Stopping ComfyUI before starting AI Toolkit"
+      set_app_runtime_state "comfyui" "$target_app" "stopping-comfyui" "Stopping ComfyUI before starting Fizgig"
       stop_process_group COMFY_APP_PID "ComfyUI"
       set_app_runtime_state "comfyui" "$target_app" "clearing-vram" "Clearing GPU memory after ComfyUI shutdown"
       clear_gpu_runtime_state
       start_comfy_switch_placeholder || true
       ;;
-    ai-toolkit)
-      set_app_runtime_state "ai-toolkit" "$target_app" "stopping-ai-toolkit" "Stopping AI Toolkit before starting ComfyUI"
-      stop_process_group AITK_APP_PID "AI Toolkit"
-      set_app_runtime_state "ai-toolkit" "$target_app" "clearing-vram" "Clearing GPU memory after AI Toolkit shutdown"
+    fizgig)
+      set_app_runtime_state "fizgig" "$target_app" "stopping-fizgig" "Stopping Fizgig before starting ComfyUI"
+      stop_process_group FIZGIG_APP_PID "Fizgig"
+      set_app_runtime_state "fizgig" "$target_app" "clearing-vram" "Clearing GPU memory after Fizgig shutdown"
       clear_gpu_runtime_state
-      start_ai_toolkit_switch_placeholder || true
+      start_fizgig_switch_placeholder || true
       ;;
   esac
 
@@ -1908,16 +1901,16 @@ switch_to_app() {
       set_app_runtime_state "comfyui" "comfyui" "starting-comfyui" "Starting ComfyUI"
       start_comfy_app_process
       ;;
-    ai-toolkit)
-      set_app_runtime_state "ai-toolkit" "ai-toolkit" "starting-ai-toolkit" "Starting AI Toolkit"
-      start_ai_toolkit_app_process
+    fizgig)
+      set_app_runtime_state "fizgig" "fizgig" "starting-fizgig" "Starting Fizgig"
+      start_fizgig_app_process
       ;;
   esac
 }
 
 CURRENT_MAIN_APP="comfyui"
 set_app_runtime_state "$CURRENT_MAIN_APP" "$CURRENT_MAIN_APP" "booting-comfyui" "ComfyUI is selected as the main app"
-start_ai_toolkit_switch_placeholder || true
+start_fizgig_switch_placeholder || true
 switch_to_app "$CURRENT_MAIN_APP" ""
 
 while true; do

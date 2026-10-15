@@ -3,6 +3,7 @@ import argparse
 import http.server
 import json
 import mimetypes
+import os
 import re
 import socketserver
 import time
@@ -23,67 +24,65 @@ def _regex(pattern: str) -> re.Pattern:
 
 def _detail_repo(line: str, current: str) -> str:
     if "cloning" in line.lower():
-        return "Cloning fresh repo"
-    if "updating repo" in line.lower():
-        return "Updating existing repo"
+        return "Cloning fresh Fizgig repo"
+    if "updating" in line.lower():
+        return "Updating Fizgig repo"
     return current
 
 
-def _detail_ui(line: str, current: str) -> str:
-    if "installing ui dependencies" in line.lower():
-        return "Installing npm dependencies"
-    if "building ui" in line.lower():
-        return "Building UI bundle"
-    if "update_db" in line.lower():
-        return "Updating database schema"
+def _detail_deps(line: str, current: str) -> str:
+    if "installing" in line.lower() or "checking" in line.lower():
+        return "Installing / checking dependencies via uv"
     return current
 
 
-AITK_STAGE_DEFS = [
+FIZGIG_STAGE_DEFS = [
     {
         "id": "repo",
         "label": "Repository",
-        "detail": "Cloning ai-toolkit source",
+        "detail": "Cloning or updating Fizgig source",
         "patterns": [
-            _regex(r"\[ai-toolkit].*cloning repo"),
-            _regex(r"\[ai-toolkit].*updating repo"),
+            _regex(r"\[fizgig\].*cloning"),
+            _regex(r"\[fizgig\].*updating"),
         ],
         "detail_from_line": _detail_repo,
     },
     {
         "id": "venv",
         "label": "Python environment",
-        "detail": "Creating virtualenv and upgrading pip",
+        "detail": "Preparing isolated virtual environment",
         "patterns": [
-            _regex(r"\[ai-toolkit].*creating venv"),
-            _regex(r"pip install --upgrade pip"),
+            _regex(r"\[fizgig\].*creating venv"),
+            _regex(r"\[fizgig\].*reusing existing venv"),
         ],
     },
     {
         "id": "deps",
         "label": "Python deps",
-        "detail": "Installing requirements",
+        "detail": "Installing Fizgig dependencies",
         "patterns": [
-            _regex(r"\[ai-toolkit].*installing requirements"),
+            _regex(r"\[fizgig\].*installing requirements"),
+            _regex(r"\[fizgig\].*checking dependencies"),
+            _regex(r"uv pip install"),
         ],
+        "detail_from_line": _detail_deps,
     },
     {
-        "id": "ui-build",
-        "label": "UI build",
-        "detail": "Preparing AI Toolkit UI",
+        "id": "models",
+        "label": "Shared models",
+        "detail": "Linking ComfyUI model directories and preferences",
         "patterns": [
-            _regex(r"installing UI dependencies"),
-            _regex(r"npm run build"),
-            _regex(r"npm run update_db"),
+            _regex(r"\[fizgig\].*configuring shared models"),
+            _regex(r"\[fizgig\].*output dirs on /workspace"),
         ],
-        "detail_from_line": _detail_ui,
     },
     {
         "id": "start",
         "label": "UI startup",
-        "detail": "Starting ai-toolkit on :8675",
+        "detail": "Starting Fizgig web UI on :8081",
         "patterns": [
-            _regex(r"\[ai-toolkit].*starting UI"),
+            _regex(r"\[fizgig\].*starting web UI"),
+            _regex(r"Fizgig web UI on"),
         ],
     },
 ]
@@ -131,11 +130,11 @@ def compute_stage_states(lines):
             "detail": definition.get("detail", ""),
             "status": "pending",
         }
-        for definition in AITK_STAGE_DEFS
+        for definition in FIZGIG_STAGE_DEFS
     ]
     current_idx = None
     for line in lines:
-        for idx, definition in enumerate(AITK_STAGE_DEFS):
+        for idx, definition in enumerate(FIZGIG_STAGE_DEFS):
             if any(pattern.search(line) for pattern in definition["patterns"]):
                 current_idx = idx
                 detail_fn = definition.get("detail_from_line")
@@ -171,7 +170,7 @@ HTML_PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AI Toolkit is installing…</title>
+  <title>Fizgig is starting…</title>
   <style>
     @font-face { font-family: 'Inter'; font-style: normal; font-weight: 100 900; font-display: swap; src: url('/assets/fonts/InterVariable.woff2') format('woff2'); }
     @font-face { font-family: 'Inter'; font-style: italic; font-weight: 100 900; font-display: swap; src: url('/assets/fonts/InterVariable-Italic.woff2') format('woff2'); }
@@ -200,14 +199,14 @@ HTML_PAGE = """<!doctype html>
   <div class="wrapper">
     <header>
       <h1>comfy.course template</h1>
-      <div class="linkline"><a href="https://course.yakushev.fr/" target="_blank" rel="noopener">course,yakushev.fr</a></div>
+      <div class="linkline"><a href="https://course.yakushev.fr/" target="_blank" rel="noopener">course.yakushev.fr</a></div>
     </header>
     <section class="note">
-      AI Toolkit add-on is installing. This usually takes a few minutes. The page will redirect automatically once the UI starts.
+      Fizgig (LoRA &amp; Fine-tune Studio) is starting. This usually takes 1–2 minutes. The page will redirect automatically once the UI is ready.
     </section>
     <ul class="stage-list" data-stage-list></ul>
     <section class="note">
-      You can keep this tab open—when the installation finishes, it will switch to AI Toolkit. If nothing happens in ~5 minutes, redeploy the pod to try again.
+      You can keep this tab open—when setup finishes, it will switch to Fizgig automatically.
     </section>
   </div>
   <script>
@@ -273,7 +272,7 @@ HTML_PAGE = """<!doctype html>
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    log_path = "/ai_toolkit_setup.log"
+    log_path = "/fizgig_setup.log"
 
     def _send_file(self, file_path: Path) -> None:
         try:
@@ -348,8 +347,8 @@ class ReuseTCPServer(socketserver.TCPServer):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8675)
-    parser.add_argument("--files", nargs="*", default=["/ai_toolkit_setup.log"])
+    parser.add_argument("--port", type=int, default=8081)
+    parser.add_argument("--files", nargs="*", default=["/fizgig_setup.log"])
     args = parser.parse_args()
     Handler.log_path = args.files[0]
     with ReuseTCPServer(("", args.port), Handler) as server:

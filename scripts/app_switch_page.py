@@ -16,12 +16,12 @@ ASSET_DIR_CANDIDATES = [
     Path("/Comfy/web/assets"),
     LOCAL_PROJECT_ROOT / "assets",
 ]
-VALID_APPS = {"comfyui", "ai-toolkit"}
+VALID_APPS = {"comfyui", "fizgig"}
 
 
 APP_LABELS = {
     "comfyui": "ComfyUI",
-    "ai-toolkit": "AI Toolkit",
+    "fizgig": "Fizgig",
 }
 
 
@@ -443,7 +443,7 @@ HTML_PAGE = """<!doctype html>
 
 class Handler(http.server.BaseHTTPRequestHandler):
     state_dir = Path("/tmp/app_state")
-    target_app = "ai-toolkit"
+    target_app = "fizgig"
     source_app = "comfyui"
 
     def _send_text(self, body: bytes, status: int = 200) -> None:

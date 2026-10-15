@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-This repository contains a high-performance, resilient **RunPod Docker Template** designed for running **ComfyUI** and **Ostris AI Toolkit** side-by-side in cloud GPU container environments. 
+This repository contains a high-performance, resilient **RunPod Docker Template** designed for running **ComfyUI** and **Fizgig** (LoRA & Fine-tune Studio for MiniMax H3, Klein 9B, Krea 2, Qwen Image, SDXL, etc.) side-by-side in cloud GPU container environments. 
 
 Rather than serving as a basic container, this template acts as an autonomous operating environment. It solves major operational challenges inherent to cloud GPU providers (such as broken host GPU drivers, CPU steal/overload, VRAM fragmentation between apps, custom node dependency conflicts, and long silent startup times) through automated preflight probes, dependency constraints, process group supervision, and interactive UI status placeholders.
 
@@ -14,19 +14,19 @@ Rather than serving as a basic container, this template acts as an autonomous op
 flowchart TD
     User([User Browser]) -->|Port 7860| NginxComfy[Nginx Port 7860: ComfyUI Proxy]
     User -->|Port 7861| NginxFB[Nginx Port 7861: Filebrowser Proxy]
-    User -->|Port 7862| NginxAITK[Nginx Port 7862: AI Toolkit Proxy]
+    User -->|Port 7862| NginxFizgig[Nginx Port 7862: Fizgig Proxy]
     User -->|Port 7863| NginxJup[Nginx Port 7863: JupyterLab Proxy]
 
     NginxComfy -->|Reverse Proxy| ComfyPort{Port 8188}
     NginxFB -->|Reverse Proxy| FBPort[Filebrowser :8080]
-    NginxAITK -->|Reverse Proxy| AITKPort{Port 8675}
+    NginxFizgig -->|Reverse Proxy| FizgigPort{Port 8081}
     NginxJup -->|Reverse Proxy| JupPort[JupyterLab :8888]
 
     ComfyPort -->|Active App| ComfyApp[ComfyUI Core / PyTorch]
     ComfyPort -.->|Booting/Switching| ComfyWait[comfy_wait_page.py / app_switch_page.py]
 
-    AITKPort -->|Active App| AITKApp[AI Toolkit Next.js UI + Worker]
-    AITKPort -.->|Booting/Switching| AITKWait[ai_toolkit_wait_page.py / app_switch_page.py]
+    FizgigPort -->|Active App| FizgigApp[Fizgig Web UI + Trainer]
+    FizgigPort -.->|Booting/Switching| FizgigWait[fizgig_wait_page.py / app_switch_page.py]
 
     subgraph Supervisor ["start.sh Supervisor Loop"]
         CUDA_Probe[1. CUDA Preflight Probe] --> CPU_Probe[2. CPU Overload Guard]
@@ -38,12 +38,15 @@ flowchart TD
 
     subgraph Storage ["Persistent Volume (/workspace)"]
         WS_Comfy[/workspace/ComfyUI]
-        WS_AITK[/workspace/ai-toolkit]
+        WS_Fizgig[/workspace/Fizgig]
+        WS_Models[/workspace/models]
         WS_Cache[/workspace/.cache]
     end
 
     ComfyApp --> WS_Comfy
-    AITKApp --> WS_AITK
+    FizgigApp --> WS_Fizgig
+    FizgigApp --> WS_Models
+    ComfyApp --> WS_Models
     ComfyApp --> WS_Cache
 ```
 
@@ -54,13 +57,13 @@ flowchart TD
 Running multiple heavy PyTorch workloads simultaneously in a single GPU container causes Out-Of-Memory (OOM) crashes. To avoid this, the container implements a **single-active-app supervisor loop** in [start.sh](file:///Users/jnx/Documents/GitHub/130/start.sh).
 
 ### Key Mechanics:
-1. **Single App Execution**: Only one main GPU application—either **ComfyUI** (port 8188) or **AI Toolkit** (port 8675)—runs at any given moment.
+1. **Single App Execution**: Only one main GPU application—either **ComfyUI** (port 8188) or **Fizgig** (port 8081)—runs at any given moment.
 2. **State Directory (`/tmp/app_state`)**:
    - `active_app`: Indicates the app currently initialized and assigned GPU access.
    - `desired_app`: Set by user interaction on the UI switch page.
    - `phase` & `detail`: Human-readable status details consumed by proxy placeholders.
 3. **Graceful App Switching Routine (`switch_to_app`)**:
-   When switching from ComfyUI to AI Toolkit (or vice versa):
+   When switching from ComfyUI to Fizgig (or vice versa):
    - **Process Termination**: Sends SIGTERM to the process group, followed by recursive descendant child PID cleanup and SIGKILL fallback if unresponded after 10 seconds.
    - **VRAM Cache Flush (`clear_gpu_runtime_state`)**: Executes a Python snippet calling `gc.collect()`, `torch.cuda.empty_cache()`, and `torch.cuda.ipc_collect()` to liberate VRAM.
    - **Placeholder Server Activation**: Spins up [app_switch_page.py](file:///Users/jnx/Documents/GitHub/130/scripts/app_switch_page.py) on the targeted port so the user sees a smooth status screen instead of a broken connection page.
@@ -82,7 +85,8 @@ The template includes multiple defensive hooks designed to mitigate common failu
 | Degraded Host / CPU Steal (>95%)  | check_cpu_overload + taskset affinity pin     |
 | Custom Node Dependency Overwrite  | /etc/pip/constraints.txt (Package Locking)    |
 | GPU Arch Incompatibility (SageAttn)| Capability Probe -> SM86 / SM89 / SM120 Whl   |
-| Missing Mediapipe in Python 3.12  | Runtime AST Patching in controlnet_aux        |
+| Fizgig Auth & Host Verification   | Runtime Ast/Source Patching in server.py      |
+| Shared Model Folder Duplication   | prefs.json scanning & /workspace/models link  |
 | Proxy CORS & Host Header Rejection| Nginx Dynamic Host/Origin Header Rewriting    |
 | Unresponsive Child Processes      | Process Group (PGID) + Descendant Killing     |
 | Image Core Updates vs Persisted WS| Core File Sync Manifest (.image_baked_core)   |
@@ -110,7 +114,7 @@ The template includes multiple defensive hooks designed to mitigate common failu
   - **Core Pinning (`compute_stable_pin_cores`)**: Calculates a stable core range (e.g., `0-71`) and executes PyTorch processes via `taskset -c` to protect worker threads from erratic core migration.
 
 ### Hook C: Python Dependency Protection (`/etc/pip/constraints.txt`)
-- **Target Files**: [dockerfile](file:///Users/jnx/Documents/GitHub/130/dockerfile#L178-L198) & [start.sh](file:///Users/jnx/Documents/GitHub/130/start.sh#L28-L37)
+- **Target Files**: [dockerfile](file:///Users/jnx/Documents/GitHub/130/dockerfile) & [start.sh](file:///Users/jnx/Documents/GitHub/130/start.sh#L28-L37)
 - **Problem**: `ComfyUI-Manager` or custom nodes installing their own `requirements.txt` frequently downgrade PyTorch, torchvision, or CUDA libraries, breaking binary C++ extension modules.
 - **Mechanism**:
   - During Docker build, the exact versions of core packages (`torch`, `torchvision`, `torchaudio`, `bitsandbytes`, `onnxruntime-gpu`, `torchcodec`, `nunchaku`) are frozen into `/etc/pip/constraints.txt`.
@@ -118,19 +122,20 @@ The template includes multiple defensive hooks designed to mitigate common failu
 
 ### Hook D: Hardware-Specific SageAttention Architecture Selector
 - **Target File**: [start.sh](file:///Users/jnx/Documents/GitHub/130/start.sh#L1150-L1208)
-- **Problem**: `SageAttention` requires C++ extensions compiled specifically for the GPU microarchitecture (Ampere, Ada Lovelace, Blackwell). Using an mismatched wheel results in invalid instruction crashes.
+- **Problem**: `SageAttention` requires C++ extensions compiled specifically for the GPU microarchitecture (Ampere, Ada Lovelace, Blackwell). Using a mismatched wheel results in invalid instruction crashes.
 - **Mechanism**:
   - Queries `torch.cuda.get_device_capability()` at startup.
   - Maps device capabilities: `86` -> `sm86` (RTX 30xx), `89` -> `sm89` (RTX 40xx), `120` -> `sm120` (RTX 50xx).
   - Installs the pre-compiled wheel matching the detected architecture from `/wheels/`.
   - If `MAKE_WHEELS=1` is passed, automatically builds and tags an architecture-specific wheel on boot and saves it to `/workspace/wheels`.
 
-### Hook E: Mediapipe Incompatibility Fallback Patch
-- **Target File**: [start.sh](file:///Users/jnx/Documents/GitHub/130/start.sh#L773-L776)
-- **Problem**: In Python 3.12 environments, `mediapipe` sometimes lacks `solutions` attributes, causing imports in `controlnet_aux` to throw fatal `AttributeError` exceptions.
+### Hook E: Fizgig Authentication Bypass & Shared Models Integration
+- **Target File**: [start.sh](file:///Users/jnx/Documents/GitHub/130/start.sh)
+- **Problem**: Fizgig defaults to requiring password authentication on RunPod, blocking direct web access. Moreover, downloading tens of gigabytes of base models (MiniMax H3 DiT, Qwen3-VL, VAE) separately for ComfyUI and Fizgig wastes disk space and time.
 - **Mechanism**:
-  - `prepare_ai_toolkit_runtime` inspects `controlnet_aux/__init__.py`.
-  - If `mediapipe` fails, it dynamically patches `from .mediapipe_face import MediapipeFaceDetector` with a safe `try...except` block, setting `MediapipeFaceDetector = None` so AI Toolkit operations can proceed without crashing.
+  - Automatically patches `src/fizgig/web/server.py` at startup to bypass `_logged_in` and `_host_ok`, setting `Handler.password = None` and `Handler.local_only = False`.
+  - Auto-configures `user_data/prefs.json` pointing `lora_output_dir` to `/workspace/ComfyUI/models/loras/` so trained LoRAs are immediately usable in ComfyUI.
+  - Automatically scans `/workspace/ComfyUI/models/` for matching base models and links them directly into Fizgig preferences without duplicating files.
 
 ### Hook F: Image Core Sync (`SYNC_IMAGE_BAKED_COMFY_CORE`)
 - **Target File**: [start.sh](file:///Users/jnx/Documents/GitHub/130/start.sh#L135-L220)
@@ -142,7 +147,7 @@ The template includes multiple defensive hooks designed to mitigate common failu
 
 ### Hook G: Robust Process Group Termination (`stop_process_group`)
 - **Target File**: [start.sh](file:///Users/jnx/Documents/GitHub/130/start.sh#L1360-L1407)
-- **Problem**: Child processes spawned by ComfyUI nodes or AI Toolkit workers (e.g. sub-processes, dataloader workers) often become orphaned when parent processes receive SIGTERM, holding onto VRAM.
+- **Problem**: Child processes spawned by ComfyUI nodes or Fizgig trainers often become orphaned when parent processes receive SIGTERM, holding onto VRAM.
 - **Mechanism**:
   - Retrieves the process group ID (`pgid`) via `ps -o pgid=`.
   - Collects all descendant PIDs recursively using `collect_descendants`.
@@ -158,7 +163,7 @@ All external communication is funneled through **Nginx** ([nginx.conf](file:///U
 |---|---|---|---|
 | **7860** | ComfyUI | 8188 | WebSockets (`/ws`), CORS & Host Origin rewriting, Ready status endpoint (`/ready`), 502 error interceptor |
 | **7861** | Filebrowser | 8080 | Custom branding theme (`/scripts/filebrowser_branding`), `--noauth`, root `/workspace` |
-| **7862** | AI Toolkit | 8675 | Next.js frontend proxy, unbuffered long-polling support |
+| **7862** | Fizgig | 8081 | Python HTTP server, password-free access, Host header normalization, unbuffered streaming |
 | **7863** | JupyterLab | 8888 | Tokenless root access, unbuffered SSE (`/api/events/`), terminal WebSocket (`/terminals/`) |
 
 ### Origin & CORS Handling in Nginx:
@@ -182,11 +187,11 @@ Instead of serving generic static 502 pages, the system includes three Python HT
    - Streams live logs from `/server.log`.
    - Parses regex triggers for git clones, pip installs, custom node snapshots, and restoration progress.
    - Displays CPU overload warnings and provides an interactive "Continue Startup" button.
-2. **[ai_toolkit_wait_page.py](file:///Users/jnx/Documents/GitHub/130/scripts/ai_toolkit_wait_page.py)**:
-   - Runs on port 8675 during AI Toolkit venv build, Node dependency installation, DB schema creation (`prisma update_db`), and Next.js bundle building.
-   - Parses multi-stage build definitions (`repo`, `venv`, `deps`, `ui-build`, `start`).
+2. **[fizgig_wait_page.py](file:///Users/jnx/Documents/GitHub/130/scripts/fizgig_wait_page.py)**:
+   - Runs on port 8081 during Fizgig repository clone/update, isolated venv initialization, dependency installation (`uv_install_deps.py`), and model linking.
+   - Parses multi-stage build definitions (`repo`, `venv`, `deps`, `models`, `start`).
 3. **[app_switch_page.py](file:///Users/jnx/Documents/GitHub/130/scripts/app_switch_page.py)**:
-   - Renders a clean transition interface when switching between ComfyUI and AI Toolkit.
+   - Renders a clean transition interface when switching between ComfyUI and Fizgig.
    - Allows one-click switching directly from the browser interface.
 
 ---
@@ -205,3 +210,4 @@ Instead of serving generic static 502 pages, the system includes three Python HT
 | `NIGHTLY_COMFYUI` | `0` | Set to `1` to switch ComfyUI core & Manager to nightly builds. Defaults to `0` (latest stable release). |
 | `PUBLIC_KEY` | *(unset)* | SSH public key to inject into `~/.ssh/authorized_keys` for remote terminal access. |
 | `NEW_MANAGER` | `0` | Installs modern `comfyui-manager` via pip instead of legacy git node. |
+| `FIZGIG_UPDATE` | `1` | Automatically pulls latest Fizgig git updates on container startup. |
