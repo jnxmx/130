@@ -721,23 +721,75 @@ prepare_fizgig_runtime() {
   fi
   local new_commit="$(git -C "$FIZGIG_DIR" rev-parse HEAD 2>/dev/null || echo "none")"
 
-  # 2. Virtual environment setup (isolated venv reusing system CUDA 13 torch)
+  # 2. Virtual environment setup (isolated venv reusing system CUDA 13 torch without re-downloading)
   local venv_needed=0
   if [[ ! -d "$FIZGIG_VENV" || ! -f "$FIZGIG_VENV/bin/python" ]]; then
-    echo "[fizgig] creating venv with --system-site-packages at $FIZGIG_VENV" >> /fizgig_setup.log
-    python3 -m venv "$FIZGIG_VENV" --system-site-packages >> /fizgig_setup.log 2>&1 || true
+    echo "[fizgig] creating isolated venv at $FIZGIG_VENV" >> /fizgig_setup.log
+    python3 -m venv "$FIZGIG_VENV" >> /fizgig_setup.log 2>&1 || true
     venv_needed=1
   else
     echo "[fizgig] reusing existing venv at $FIZGIG_VENV" >> /fizgig_setup.log
+    if [[ -f "$FIZGIG_VENV/pyvenv.cfg" ]]; then
+      sed -i 's/include-system-site-packages = true/include-system-site-packages = false/' "$FIZGIG_VENV/pyvenv.cfg" 2>/dev/null || true
+    fi
   fi
 
+  # Symlink system PyTorch & CUDA packages into isolated venv (zero download, CUDA 13 retained)
+  echo "[fizgig] linking system CUDA 13 PyTorch packages into isolated venv..." >> /fizgig_setup.log
+  FIZGIG_VENV="$FIZGIG_VENV" python3 - <<'PY' >> /fizgig_setup.log 2>&1
+import os, sys, glob
+from pathlib import Path
+
+target_site = None
+venv_dir = os.environ.get("FIZGIG_VENV", "/workspace/Fizgig/venv")
+for d in Path(venv_dir).glob("lib/python*/site-packages"):
+    if d.is_dir():
+        target_site = d
+        break
+
+if not target_site:
+    print("[fizgig][error] could not locate venv site-packages directory")
+    sys.exit(0)
+
+target_site.mkdir(parents=True, exist_ok=True)
+
+# Find system site-packages containing torch
+sys_site = None
+for c in ["/usr/local/lib/python3.12/dist-packages", "/usr/local/lib/python3.11/dist-packages", "/usr/lib/python3/dist-packages"]:
+    if os.path.isdir(os.path.join(c, "torch")):
+        sys_site = c
+        break
+
+if not sys_site:
+    try:
+        import torch
+        sys_site = str(Path(torch.__file__).parent.parent)
+    except Exception:
+        sys_site = "/usr/local/lib/python3.12/dist-packages"
+
+patterns = ["torch*", "torchvision*", "torchaudio*", "nvidia*", "triton*"]
+linked = 0
+for pat in patterns:
+    for src in glob.glob(os.path.join(sys_site, pat)):
+        name = os.path.basename(src)
+        dst = target_site / name
+        if not dst.exists() and not dst.is_symlink():
+            try:
+                dst.symlink_to(src)
+                linked += 1
+            except Exception as e:
+                print(f"[fizgig][warn] could not link {name}: {e}")
+
+print(f"[fizgig] linked {linked} torch/cuda package entries from system into isolated venv")
+PY
+
   # 3. Dependencies installation (only if venv created or repo updated or not marked prepared)
-  if [[ "$venv_needed" == "1" || "$old_commit" != "$new_commit" || ! -f "$FIZGIG_DIR/.prepared" ]]; then
+  if [[ "$venv_needed" == "1" || "$old_commit" != "$new_commit" || ! -f "$FIZGIG_DIR/.prepared" || ! -f "$FIZGIG_VENV/.isolated_torch_linked" ]]; then
     echo "[fizgig] ensuring pip and uv in venv..." >> /fizgig_setup.log
     "$FIZGIG_VENV/bin/python" -m pip install --upgrade pip uv >> /fizgig_setup.log 2>&1 || true
 
     if [[ -f "$FIZGIG_DIR/requirements.txt" ]]; then
-      echo "[fizgig] installing requirements (excluding torch binaries to retain base image CUDA 13 PyTorch)" >> /fizgig_setup.log
+      echo "[fizgig] installing requirements into isolated venv..." >> /fizgig_setup.log
       local tmp_req="$FIZGIG_DIR/requirements.no-torch.txt"
       grep -Ev '^(torch|torchvision|torchaudio)($|[<>=])|--extra-index-url' "$FIZGIG_DIR/requirements.txt" > "$tmp_req" 2>/dev/null || cp "$FIZGIG_DIR/requirements.txt" "$tmp_req"
 
@@ -749,8 +801,9 @@ prepare_fizgig_runtime() {
         DISABLE_CUDA=1 "$FIZGIG_VENV/bin/python" -m uv pip install -r "$tmp_req" >> /fizgig_setup.log 2>&1 || true
       fi
     fi
+    touch "$FIZGIG_VENV/.isolated_torch_linked"
   else
-    echo "[fizgig] venv and requirements already up to date (${new_commit:0:7})" >> /fizgig_setup.log
+    echo "[fizgig] isolated venv and requirements already up to date (${new_commit:0:7})" >> /fizgig_setup.log
   fi
 
   # 4. Patch Fizgig to disable password authentication and allow web access via proxy
@@ -783,6 +836,64 @@ if server_file.is_file():
         text = text.replace('a = ap.parse_args(argv)', 'a = ap.parse_args(argv)\n    a.password = None')
     server_file.write_text(text, encoding="utf-8")
     print("[fizgig] password authentication and host check disabled in server.py")
+
+# Patch batch_caption.py for Florence-2 compatibility with newer transformers
+batch_caption_file = Path(fizgig_dir) / "src" / "fizgig" / "scripts" / "batch_caption.py"
+if batch_caption_file.is_file():
+    text = batch_caption_file.read_text(encoding="utf-8")
+    target_str = "    from transformers import AutoModelForCausalLM, AutoProcessor"
+    patch_str = """    from transformers import AutoModelForCausalLM, AutoProcessor
+    from transformers.configuration_utils import PretrainedConfig
+    from transformers.modeling_utils import PreTrainedModel
+    PretrainedConfig.forced_bos_token_id = None
+    PreTrainedModel._supports_sdpa = True"""
+    if "PretrainedConfig.forced_bos_token_id = None" not in text:
+        text = text.replace(target_str, patch_str)
+        batch_caption_file.write_text(text, encoding="utf-8")
+        print("[fizgig] patched batch_caption.py for Florence-2 transformers compatibility")
+
+# Install sitecustomize.py in venvs and system python so all processes inherit the fix
+sc_code = """# Florence-2 compatibility patch for transformers >= 4.48
+try:
+    import transformers.configuration_utils
+    transformers.configuration_utils.PretrainedConfig.forced_bos_token_id = None
+except Exception:
+    pass
+
+try:
+    import transformers.modeling_utils
+    transformers.modeling_utils.PreTrainedModel._supports_sdpa = True
+except Exception:
+    pass
+"""
+for d in [
+    os.environ.get("FIZGIG_VENV", "") + "/lib/python3.12/site-packages",
+    "/workspace/ComfyUI/venv/lib/python3.12/site-packages",
+    "/usr/local/lib/python3.12/dist-packages"
+]:
+    dp = Path(d)
+    if dp.is_dir():
+        sc = dp / "sitecustomize.py"
+        existing = sc.read_text(encoding="utf-8") if sc.is_file() else ""
+        if "PretrainedConfig.forced_bos_token_id = None" not in existing:
+            sc.write_text(existing + "\n" + sc_code if existing else sc_code, encoding="utf-8")
+            print(f"[deps] installed Florence-2 compatibility patch in {sc}")
+
+# Scan for any already-cached configuration_florence2.py and patch it directly
+for root in ["/root/.cache", "/workspace/.cache", os.path.expanduser("~/.cache")]:
+    if os.path.isdir(root):
+        for p in Path(root).rglob("configuration_florence2.py"):
+            try:
+                txt = p.read_text(encoding="utf-8")
+                if "if self.forced_bos_token_id is None" in txt:
+                    txt = txt.replace(
+                        "if self.forced_bos_token_id is None",
+                        "if getattr(self, 'forced_bos_token_id', None) is None"
+                    )
+                    p.write_text(txt, encoding="utf-8")
+                    print(f"[deps] patched cached {p}")
+            except Exception:
+                pass
 PY
 
   # 5. Shared model directories & preferences configuration
@@ -1592,6 +1703,7 @@ if [[ -n "${COMFYUI_BACKUP-}" ]]; then
     fi
   done
 fi
+
 
 # --- Update core + custom nodes when repos change (idempotent) ---
 if [[ -d /workspace/ComfyUI ]]; then
