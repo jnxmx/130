@@ -721,23 +721,75 @@ prepare_fizgig_runtime() {
   fi
   local new_commit="$(git -C "$FIZGIG_DIR" rev-parse HEAD 2>/dev/null || echo "none")"
 
-  # 2. Virtual environment setup (isolated venv reusing system CUDA 13 torch)
+  # 2. Virtual environment setup (isolated venv reusing system CUDA 13 torch without re-downloading)
   local venv_needed=0
   if [[ ! -d "$FIZGIG_VENV" || ! -f "$FIZGIG_VENV/bin/python" ]]; then
-    echo "[fizgig] creating venv with --system-site-packages at $FIZGIG_VENV" >> /fizgig_setup.log
-    python3 -m venv "$FIZGIG_VENV" --system-site-packages >> /fizgig_setup.log 2>&1 || true
+    echo "[fizgig] creating isolated venv at $FIZGIG_VENV" >> /fizgig_setup.log
+    python3 -m venv "$FIZGIG_VENV" >> /fizgig_setup.log 2>&1 || true
     venv_needed=1
   else
     echo "[fizgig] reusing existing venv at $FIZGIG_VENV" >> /fizgig_setup.log
+    if [[ -f "$FIZGIG_VENV/pyvenv.cfg" ]]; then
+      sed -i 's/include-system-site-packages = true/include-system-site-packages = false/' "$FIZGIG_VENV/pyvenv.cfg" 2>/dev/null || true
+    fi
   fi
 
+  # Symlink system PyTorch & CUDA packages into isolated venv (zero download, CUDA 13 retained)
+  echo "[fizgig] linking system CUDA 13 PyTorch packages into isolated venv..." >> /fizgig_setup.log
+  FIZGIG_VENV="$FIZGIG_VENV" python3 - <<'PY' >> /fizgig_setup.log 2>&1
+import os, sys, glob
+from pathlib import Path
+
+target_site = None
+venv_dir = os.environ.get("FIZGIG_VENV", "/workspace/Fizgig/venv")
+for d in Path(venv_dir).glob("lib/python*/site-packages"):
+    if d.is_dir():
+        target_site = d
+        break
+
+if not target_site:
+    print("[fizgig][error] could not locate venv site-packages directory")
+    sys.exit(0)
+
+target_site.mkdir(parents=True, exist_ok=True)
+
+# Find system site-packages containing torch
+sys_site = None
+for c in ["/usr/local/lib/python3.12/dist-packages", "/usr/local/lib/python3.11/dist-packages", "/usr/lib/python3/dist-packages"]:
+    if os.path.isdir(os.path.join(c, "torch")):
+        sys_site = c
+        break
+
+if not sys_site:
+    try:
+        import torch
+        sys_site = str(Path(torch.__file__).parent.parent)
+    except Exception:
+        sys_site = "/usr/local/lib/python3.12/dist-packages"
+
+patterns = ["torch*", "torchvision*", "torchaudio*", "nvidia*", "triton*"]
+linked = 0
+for pat in patterns:
+    for src in glob.glob(os.path.join(sys_site, pat)):
+        name = os.path.basename(src)
+        dst = target_site / name
+        if not dst.exists() and not dst.is_symlink():
+            try:
+                dst.symlink_to(src)
+                linked += 1
+            except Exception as e:
+                print(f"[fizgig][warn] could not link {name}: {e}")
+
+print(f"[fizgig] linked {linked} torch/cuda package entries from system into isolated venv")
+PY
+
   # 3. Dependencies installation (only if venv created or repo updated or not marked prepared)
-  if [[ "$venv_needed" == "1" || "$old_commit" != "$new_commit" || ! -f "$FIZGIG_DIR/.prepared" ]]; then
+  if [[ "$venv_needed" == "1" || "$old_commit" != "$new_commit" || ! -f "$FIZGIG_DIR/.prepared" || ! -f "$FIZGIG_VENV/.isolated_torch_linked" ]]; then
     echo "[fizgig] ensuring pip and uv in venv..." >> /fizgig_setup.log
     "$FIZGIG_VENV/bin/python" -m pip install --upgrade pip uv >> /fizgig_setup.log 2>&1 || true
 
     if [[ -f "$FIZGIG_DIR/requirements.txt" ]]; then
-      echo "[fizgig] installing requirements (excluding torch binaries to retain base image CUDA 13 PyTorch)" >> /fizgig_setup.log
+      echo "[fizgig] installing requirements into isolated venv..." >> /fizgig_setup.log
       local tmp_req="$FIZGIG_DIR/requirements.no-torch.txt"
       grep -Ev '^(torch|torchvision|torchaudio)($|[<>=])|--extra-index-url' "$FIZGIG_DIR/requirements.txt" > "$tmp_req" 2>/dev/null || cp "$FIZGIG_DIR/requirements.txt" "$tmp_req"
 
@@ -749,8 +801,9 @@ prepare_fizgig_runtime() {
         DISABLE_CUDA=1 "$FIZGIG_VENV/bin/python" -m uv pip install -r "$tmp_req" >> /fizgig_setup.log 2>&1 || true
       fi
     fi
+    touch "$FIZGIG_VENV/.isolated_torch_linked"
   else
-    echo "[fizgig] venv and requirements already up to date (${new_commit:0:7})" >> /fizgig_setup.log
+    echo "[fizgig] isolated venv and requirements already up to date (${new_commit:0:7})" >> /fizgig_setup.log
   fi
 
   # 4. Patch Fizgig to disable password authentication and allow web access via proxy
