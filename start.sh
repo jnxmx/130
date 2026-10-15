@@ -134,20 +134,26 @@ write_comfy_image_sync_marker() {
 refresh_comfy_image_sync_manifest() {
   local root="$1"
   [[ -d "$root/.git" ]] || return 0
-  COMFY_SYNC_ROOT="$root" COMFY_SYNC_MANIFEST="$(comfy_image_sync_manifest_path "$root")" python - <<'PY'
+  COMFY_SYNC_ROOT="$root" COMFY_SYNC_MANIFEST="$(comfy_image_sync_manifest_path "$root")" python3 - <<'PY' || true
 from pathlib import Path
 import os
 import subprocess
 
 root = Path(os.environ["COMFY_SYNC_ROOT"])
 manifest_path = Path(os.environ["COMFY_SYNC_MANIFEST"])
-output = subprocess.check_output(["git", "-C", str(root), "ls-files", "-z"])
-tracked = sorted(
-    entry.decode("utf-8")
-    for entry in output.split(b"\x00")
-    if entry
-)
-manifest_path.write_text("".join(f"{entry}\n" for entry in tracked), encoding="utf-8")
+try:
+    output = subprocess.check_output(
+        ["git", "-c", "safe.directory=*", "-C", str(root), "ls-files", "-z"],
+        stderr=subprocess.DEVNULL
+    )
+    tracked = sorted(
+        entry.decode("utf-8")
+        for entry in output.split(b"\x00")
+        if entry
+    )
+    manifest_path.write_text("".join(f"{entry}\n" for entry in tracked), encoding="utf-8")
+except Exception:
+    pass
 PY
 }
 
@@ -1281,43 +1287,33 @@ cleanup_legacy_manager_settings_dir() {
 # --- First boot: persist ComfyUI into /workspace and fetch taesd ---
 if [[ ! -d /workspace/ComfyUI && -d /Comfy ]]; then
   image_comfy_head="$(current_image_comfy_head)"
-  if [[ ! -f /Comfy/models/vae_approx/taew2_1.safetensors && ! -f /Comfy/models/checkpoints/taew2_1.safetensors ]]; then
-    mkdir -p /Comfy/models/vae_approx
-    curl -L \
-      https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/taew2_1.safetensors \
-      -o /Comfy/models/vae_approx/taew2_1.safetensors || true
-  fi
-  if [[ ! -f /Comfy/models/vae_approx/taeh3.safetensors ]]; then
-    mkdir -p /Comfy/models/vae_approx
-    echo "Downloading TAE-H3 VAE approx model..."
-    curl -fL --retry 3 \
-      https://raw.githubusercontent.com/madebyollin/taehv/62f7591f59dfbb4c3c02b7a621d180a9eeaba26c/safetensors/taeh3.safetensors \
-      -o /Comfy/models/vae_approx/taeh3.safetensors || true
-  fi
-  if [[ ! -f /Comfy/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors ]]; then
-    mkdir -p /Comfy/models/latent_upscale_models
-    echo "Downloading Minimax H3 Latent Upscaler weights..."
-    curl -fL --retry 3 \
-      https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/resolve/main/minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors \
-      -o /Comfy/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors || true
-  fi
   echo "Persisting ComfyUI to /workspace (first boot)…"
   mv /Comfy /workspace/ComfyUI
   write_comfy_image_sync_marker /workspace/ComfyUI "${image_comfy_head:-}"
-  refresh_comfy_image_sync_manifest /workspace/ComfyUI
+  refresh_comfy_image_sync_manifest /workspace/ComfyUI || true
 else
   echo "ComfyUI already present in /workspace; skipping copy."
   if [[ "${SYNC_IMAGE_BAKED_COMFY_CORE:-0}" == "1" ]]; then
     sync_image_baked_comfy_core
   fi
-  if [[ -d /workspace/ComfyUI/models && ! -f /workspace/ComfyUI/models/vae_approx/taeh3.safetensors ]]; then
+fi
+
+if [[ -d /workspace/ComfyUI/models ]]; then
+  if [[ ! -f /workspace/ComfyUI/models/vae_approx/taew2_1.safetensors && ! -f /workspace/ComfyUI/models/checkpoints/taew2_1.safetensors ]]; then
+    mkdir -p /workspace/ComfyUI/models/vae_approx
+    echo "Downloading TAE-W2.1 VAE approx model..."
+    curl -fL --retry 3 \
+      https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/taew2_1.safetensors \
+      -o /workspace/ComfyUI/models/vae_approx/taew2_1.safetensors || true
+  fi
+  if [[ ! -f /workspace/ComfyUI/models/vae_approx/taeh3.safetensors ]]; then
     mkdir -p /workspace/ComfyUI/models/vae_approx
     echo "Downloading TAE-H3 VAE approx model..."
     curl -fL --retry 3 \
       https://raw.githubusercontent.com/madebyollin/taehv/62f7591f59dfbb4c3c02b7a621d180a9eeaba26c/safetensors/taeh3.safetensors \
       -o /workspace/ComfyUI/models/vae_approx/taeh3.safetensors || true
   fi
-  if [[ -d /workspace/ComfyUI/models && ! -f /workspace/ComfyUI/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors ]]; then
+  if [[ ! -f /workspace/ComfyUI/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors ]]; then
     mkdir -p /workspace/ComfyUI/models/latent_upscale_models
     echo "Downloading Minimax H3 Latent Upscaler weights..."
     curl -fL --retry 3 \
