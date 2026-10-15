@@ -22,9 +22,7 @@ echo "========================================================"
 export PYTHONWARNINGS="ignore"
 export PIP_DISABLE_PIP_VERSION_CHECK="1"
 export HF_HUB_DISABLE_TELEMETRY="1"
-# Prevent cuDNN 9 sublibrary loading crashes during SDPA attention in PyTorch (falls back to Flash/Math SDPA)
-export TORCH_CUDNN_SDPA_ENABLED="0"
-ENABLE_RUNTIME_REPO_UPDATES="${ENABLE_RUNTIME_REPO_UPDATES:-0}"
+ENABLE_RUNTIME_REPO_UPDATES="${ENABLE_RUNTIME_REPO_UPDATES:-1}"
 # Persist pip cache across runs to speed installs
 export PIP_CACHE_DIR="/workspace/.cache/pip"
 PYTORCH_WHL_INDEX="${PYTORCH_WHL_INDEX:-https://download.pytorch.org/whl/cu130}"
@@ -1841,12 +1839,12 @@ launch_comfyui_runtime() {
   if [[ -n "$pin_cores" ]] && command -v taskset >/dev/null 2>&1; then
     if taskset -c "$pin_cores" true >/dev/null 2>&1; then
       echo "[cpu] Applying CPU affinity mask: $pin_cores"
-      TORCH_CUDNN_SDPA_ENABLED=0 PIP_NO_COMPILE=1 COMFYUI_ALLOWED_HOSTS="*" COMFYUI_CORS_ALLOWED_ORIGINS="*" taskset -c "$pin_cores" "$VIRTUAL_ENV/bin/python" main.py "${comfy_args[@]}"
+      PIP_NO_COMPILE=1 COMFYUI_ALLOWED_HOSTS="*" COMFYUI_CORS_ALLOWED_ORIGINS="*" taskset -c "$pin_cores" "$VIRTUAL_ENV/bin/python" main.py "${comfy_args[@]}"
       return $?
     fi
     echo "[cpu][warn] Invalid CPU affinity mask '$pin_cores'; launching without taskset."
   fi
-  TORCH_CUDNN_SDPA_ENABLED=0 PIP_NO_COMPILE=1 COMFYUI_ALLOWED_HOSTS="*" COMFYUI_CORS_ALLOWED_ORIGINS="*" "$VIRTUAL_ENV/bin/python" main.py "${comfy_args[@]}"
+  PIP_NO_COMPILE=1 COMFYUI_ALLOWED_HOSTS="*" COMFYUI_CORS_ALLOWED_ORIGINS="*" "$VIRTUAL_ENV/bin/python" main.py "${comfy_args[@]}"
 }
 
 launch_fizgig_runtime() {
