@@ -23,22 +23,6 @@ export PYTHONWARNINGS="ignore"
 export PIP_DISABLE_PIP_VERSION_CHECK="1"
 export HF_HUB_DISABLE_TELEMETRY="1"
 ENABLE_RUNTIME_REPO_UPDATES="${ENABLE_RUNTIME_REPO_UPDATES:-1}"
-
-# --- Auto-update start.sh from GitHub when ENABLE_RUNTIME_REPO_UPDATES=1 ---
-if [[ "${ENABLE_RUNTIME_REPO_UPDATES:-1}" == "1" && -z "${START_SH_UPDATED:-}" ]]; then
-  echo "[bootstrap] checking for latest start.sh from GitHub (jnxmx/130)..."
-  if curl -fsSL --connect-timeout 5 --max-time 15 "https://raw.githubusercontent.com/jnxmx/130/main/start.sh" -o /tmp/start_latest.sh 2>/dev/null; then
-    if [[ -s /tmp/start_latest.sh ]] && bash -n /tmp/start_latest.sh 2>/dev/null; then
-      if ! cmp -s /start.sh /tmp/start_latest.sh; then
-        echo "[bootstrap] updated start.sh fetched from GitHub; re-executing with latest logic..."
-        cp /tmp/start_latest.sh /start.sh
-        chmod +x /start.sh
-        export START_SH_UPDATED=1
-        exec /start.sh "$@"
-      fi
-    fi
-  fi
-fi
 # Persist pip cache across runs to speed installs
 export PIP_CACHE_DIR="/workspace/.cache/pip"
 PYTORCH_WHL_INDEX="${PYTORCH_WHL_INDEX:-https://download.pytorch.org/whl/cu130}"
