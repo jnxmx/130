@@ -1821,6 +1821,22 @@ if [[ -n "${COMFYUI_BACKUP-}" ]]; then
   done
 fi
 
+# --- Set runpod shutdown timer setting in comfy.settings.json when env variable provided ---
+if [[ "${DISABLE_SHUTDOWN_TIMER:-0}" == "1" || "${RUNPOD_DISABLE_SHUTDOWN_TIMER:-0}" == "1" || "${DISABLE_TIMER:-0}" == "1" || "${RUNPOD_TIMER_ENABLED:-1}" == "0" ]]; then
+  export DISABLE_SHUTDOWN_TIMER=1
+  export RUNPOD_DISABLE_SHUTDOWN_TIMER=1
+  export RUNPOD_TIMER_ENABLED=0
+  for settings in \
+      /workspace/ComfyUI/user/default/comfy.settings.json \
+      /Comfy/user/default/comfy.settings.json; do
+    if [[ -f "$settings" ]]; then
+      tmp="${settings}.tmp"
+      jq '."runpod.enable_shutdown_timer" = false' "$settings" > "$tmp" && mv "$tmp" "$settings"
+      echo "[settings] runpod.enable_shutdown_timer disabled in $settings"
+    fi
+  done
+fi
+
 
 # --- Update core + custom nodes when repos change (idempotent) ---
 if [[ -d /workspace/ComfyUI ]]; then
@@ -2064,6 +2080,9 @@ export FIZGIG_UI_PORT
 export FIZGIG_UPDATE
 export APP_STATE_DIR
 export NIGHTLY_COMFYUI
+export DISABLE_SHUTDOWN_TIMER
+export RUNPOD_DISABLE_SHUTDOWN_TIMER
+export RUNPOD_TIMER_ENABLED
 
 spawn_app_session() {
   local command_text="$1"

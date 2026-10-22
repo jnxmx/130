@@ -210,4 +210,5 @@ Instead of serving generic static 502 pages, the system includes three Python HT
 | `NIGHTLY_COMFYUI` | `0` | Set to `1` to switch ComfyUI core & Manager to nightly builds. Defaults to `0` (latest stable release). |
 | `PUBLIC_KEY` | *(unset)* | SSH public key to inject into `~/.ssh/authorized_keys` for remote terminal access. |
 | `NEW_MANAGER` | `0` | Installs modern `comfyui-manager` via pip instead of legacy git node. |
+| `DISABLE_SHUTDOWN_TIMER` | `0` | Set to `1` (or `RUNPOD_DISABLE_SHUTDOWN_TIMER=1`) to disable the auto-shutdown timer in ComfyUI-RunPod-Control. |
 | `FIZGIG_UPDATE` | `1` | Automatically pulls latest Fizgig git updates on container startup. |
