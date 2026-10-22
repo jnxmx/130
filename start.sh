@@ -406,9 +406,28 @@ set_app_runtime_state() {
   write_state_value "$APP_DETAIL_FILE" "$detail"
 }
 
+is_pid_alive() {
+  local p="${1:-}"
+  [[ -n "$p" ]] || return 1
+  if ! kill -0 "$p" 2>/dev/null; then
+    return 1
+  fi
+  if [[ -f "/proc/$p/status" ]]; then
+    if grep -qE '^State:[[:space:]]*Z' "/proc/$p/status" 2>/dev/null; then
+      return 1
+    fi
+  else
+    local st
+    st="$(ps -o stat= -p "$p" 2>/dev/null || echo "")"
+    if [[ "$st" == *Z* ]]; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
 placeholder_running() {
-  local pid="${1:-}"
-  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+  is_pid_alive "${1:-}"
 }
 
 stop_placeholder_process() {
@@ -417,6 +436,9 @@ stop_placeholder_process() {
   if placeholder_running "${placeholder_pid_ref:-}"; then
     kill "${placeholder_pid_ref}" 2>/dev/null || true
     sleep 0.5
+    if placeholder_running "${placeholder_pid_ref:-}"; then
+      kill -9 "${placeholder_pid_ref}" 2>/dev/null || true
+    fi
   fi
   placeholder_pid_ref=""
 }
@@ -676,21 +698,26 @@ start_fizgig_placeholder() {
 
 prepare_fizgig_runtime() {
   set +e
+  if [[ -f "/tmp/fizgig_prep.done" && -f "$FIZGIG_DIR/fizgig.py" && -f "$FIZGIG_VENV/bin/python" ]]; then
+    echo "[fizgig] runtime already prepared in this session; skipping redundant prep" >> /fizgig_setup.log
+    return 0
+  fi
+
   local lock_file="/tmp/fizgig_prep.lock"
   if [[ -f "$lock_file" ]]; then
     local lock_pid
     lock_pid="$(cat "$lock_file" 2>/dev/null || echo)"
-    if [[ -n "$lock_pid" && "$lock_pid" != "$$" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+    if [[ -n "$lock_pid" && "$lock_pid" != "$$" ]] && is_pid_alive "$lock_pid"; then
       echo "[fizgig] background preparation is currently running (pid=$lock_pid); waiting for it..." >> /fizgig_setup.log
-      while kill -0 "$lock_pid" 2>/dev/null; do
+      while is_pid_alive "$lock_pid" && [[ ! -f "/tmp/fizgig_prep.done" ]]; do
         sleep 1
       done
       echo "[fizgig] background preparation finished." >> /fizgig_setup.log
     fi
+    rm -f "$lock_file" 2>/dev/null || true
   fi
 
   if [[ -f "/tmp/fizgig_prep.done" && -f "$FIZGIG_DIR/fizgig.py" && -f "$FIZGIG_VENV/bin/python" ]]; then
-    echo "[fizgig] runtime already prepared in this session; skipping redundant prep" >> /fizgig_setup.log
     return 0
   fi
 
@@ -815,7 +842,7 @@ for pat in patterns:
         try:
             if name.endswith((".dist-info", ".egg-info")):
                 if os.path.isdir(src):
-                    shutil.copytree(src, dst)
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
                     copied_dist_info += 1
                 record = Path(src) / "RECORD"
                 if record.exists():
@@ -1806,8 +1833,7 @@ COMFY_APP_PID=""
 FIZGIG_APP_PID=""
 
 process_running() {
-  local pid="${1:-}"
-  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+  is_pid_alive "${1:-}"
 }
 
 collect_descendants() {
@@ -1949,7 +1975,11 @@ launch_fizgig_runtime() {
   if [[ -n "${FIZGIG_PLACEHOLDER_PID:-}" ]]; then
     kill "${FIZGIG_PLACEHOLDER_PID}" 2>/dev/null || true
     sleep 0.5
+    kill -9 "${FIZGIG_PLACEHOLDER_PID}" 2>/dev/null || true
   fi
+  pkill -f "fizgig_wait_page.py.*${FIZGIG_UI_PORT}" 2>/dev/null || true
+  pkill -f "app_switch_page.py.*${FIZGIG_UI_PORT}" 2>/dev/null || true
+  sleep 0.5
   echo "[fizgig] starting web UI on :$FIZGIG_UI_PORT (PATH prefixed with venv)" >> /fizgig_setup.log
   cd "$FIZGIG_DIR" || return 1
   local hf_env=()
@@ -1963,6 +1993,7 @@ launch_fizgig_runtime() {
     "$FIZGIG_VENV/bin/python" fizgig.py --web --port "$FIZGIG_UI_PORT" --host 127.0.0.1 >> /fizgig_ui.log 2>&1
 }
 
+export -f is_pid_alive
 export -f placeholder_running
 export -f stop_placeholder_process
 export -f pip_install

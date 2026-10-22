@@ -83,6 +83,7 @@ FIZGIG_STAGE_DEFS = [
         "patterns": [
             _regex(r"\[fizgig\].*starting web UI"),
             _regex(r"Fizgig web UI on"),
+            _regex(r"\[fizgig\].*preparation complete"),
         ],
     },
 ]
