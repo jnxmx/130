@@ -696,11 +696,21 @@ start_fizgig_placeholder() {
   start_fizgig_startup_placeholder "$@"
 }
 
+is_fizgig_venv_healthy() {
+  [[ -f "$FIZGIG_DIR/fizgig.py" && -f "$FIZGIG_VENV/bin/python" ]] || return 1
+  "$FIZGIG_VENV/bin/python" -c "import torch, torchvision, diffusers, transformers" >/dev/null 2>&1
+}
+
 prepare_fizgig_runtime() {
   set +e
-  if [[ -f "/tmp/fizgig_prep.done" && -f "$FIZGIG_DIR/fizgig.py" && -f "$FIZGIG_VENV/bin/python" ]]; then
-    echo "[fizgig] runtime already prepared in this session; skipping redundant prep" >> /fizgig_setup.log
-    return 0
+  if [[ -f "/tmp/fizgig_prep.done" ]]; then
+    if is_fizgig_venv_healthy; then
+      echo "[fizgig] runtime already prepared in this session; skipping redundant prep" >> /fizgig_setup.log
+      return 0
+    else
+      echo "[fizgig][warn] previous prep marker found but venv health check failed; re-running preparation" >> /fizgig_setup.log
+      rm -f "/tmp/fizgig_prep.done" "$FIZGIG_DIR/.prepared" "$FIZGIG_VENV/.isolated_torch_linked" 2>/dev/null || true
+    fi
   fi
 
   local lock_file="/tmp/fizgig_prep.lock"
@@ -717,8 +727,12 @@ prepare_fizgig_runtime() {
     rm -f "$lock_file" 2>/dev/null || true
   fi
 
-  if [[ -f "/tmp/fizgig_prep.done" && -f "$FIZGIG_DIR/fizgig.py" && -f "$FIZGIG_VENV/bin/python" ]]; then
-    return 0
+  if [[ -f "/tmp/fizgig_prep.done" ]]; then
+    if is_fizgig_venv_healthy; then
+      return 0
+    else
+      rm -f "/tmp/fizgig_prep.done" "$FIZGIG_DIR/.prepared" "$FIZGIG_VENV/.isolated_torch_linked" 2>/dev/null || true
+    fi
   fi
 
   echo "$$" > "$lock_file"
@@ -805,9 +819,22 @@ if not sys_site:
 
 patterns = [
     "torch*", "functorch*", "torchvision*", "torchaudio*",
-    "nvidia*", "triton*", "cuda*", "cublas*", "cudnn*", "caffe2*",
-    "hf_transfer*", "hf-transfer*", "huggingface_hub*"
+    "nvidia*", "triton*", "cuda*", "cublas*", "cudnn*", "caffe2*"
 ]
+
+# Clean up legacy non-torch symlinks and dist-infos so uv has full control over them
+for legacy_pat in ["hf_transfer*", "hf-transfer*", "huggingface_hub*"]:
+    for dst in target_site.glob(legacy_pat):
+        if dst.is_symlink() or dst.is_file():
+            dst.unlink(missing_ok=True)
+        elif dst.is_dir() and dst.name.endswith((".dist-info", ".egg-info")):
+            shutil.rmtree(dst, ignore_errors=True)
+
+# Also ensure any other non-torch symlinks are removed
+for item in target_site.iterdir():
+    if item.is_symlink():
+        if not any(item.match(p) for p in patterns):
+            item.unlink(missing_ok=True)
 
 # 1. Clean stale/broken packages or symlinks in target_site that do not match sys_site
 for pat in patterns:
@@ -885,10 +912,14 @@ PY
   if "$FIZGIG_VENV/bin/python" -c "import hf_transfer" 2>/dev/null; then
     hf_transfer_present=1
   fi
+  local core_deps_present=0
+  if "$FIZGIG_VENV/bin/python" -c "import diffusers, transformers" 2>/dev/null; then
+    core_deps_present=1
+  fi
 
-  if [[ "$venv_needed" == "1" || "$old_commit" != "$new_commit" || ! -f "$FIZGIG_DIR/.prepared" || ! -f "$FIZGIG_VENV/.isolated_torch_linked" || "$functorch_present" != "1" || "$hf_transfer_present" != "1" ]]; then
-    echo "[fizgig] ensuring pip and uv in venv..." >> /fizgig_setup.log
-    "$FIZGIG_VENV/bin/python" -m pip install --upgrade pip uv >> /fizgig_setup.log 2>&1 || true
+  if [[ "$venv_needed" == "1" || "$old_commit" != "$new_commit" || ! -f "$FIZGIG_DIR/.prepared" || ! -f "$FIZGIG_VENV/.isolated_torch_linked" || "$functorch_present" != "1" || "$hf_transfer_present" != "1" || "$core_deps_present" != "1" ]]; then
+    echo "[fizgig] ensuring pip, uv, wheel, and setuptools in venv..." >> /fizgig_setup.log
+    "$FIZGIG_VENV/bin/python" -m pip install --upgrade pip uv wheel setuptools >> /fizgig_setup.log 2>&1 || true
 
     if [[ -f "$FIZGIG_DIR/requirements.txt" ]]; then
       echo "[fizgig] installing requirements into isolated venv..." >> /fizgig_setup.log
@@ -896,7 +927,7 @@ PY
       # Strip --extra-index-url (which hardcodes cu128 in Fizgig repo) so we retain CUDA 13.0
       grep -Ev '^\s*--extra-index-url' "$FIZGIG_DIR/requirements.txt" > "$tmp_req" 2>/dev/null || cp "$FIZGIG_DIR/requirements.txt" "$tmp_req"
       # Ensure hf_transfer is installed for fast downloads and HF_HUB_ENABLE_HF_TRANSFER compatibility
-      grep -q "^hf_transfer" "$tmp_req" 2>/dev/null || echo "hf_transfer" >> "$tmp_req"
+      grep -q -E "^hf[-_]transfer" "$tmp_req" 2>/dev/null || echo "hf_transfer" >> "$tmp_req"
 
       local constraint_args=()
       if [[ -n "${PIP_CONSTRAINT:-}" && -f "${PIP_CONSTRAINT}" ]]; then
@@ -905,6 +936,7 @@ PY
 
       export UV_LINK_MODE="copy"
 
+      local install_ok=0
       if env DISABLE_CUDA=1 \
           "$FIZGIG_VENV/bin/python" -m uv pip install \
             --link-mode=copy \
@@ -912,15 +944,28 @@ PY
             "${constraint_args[@]}" \
             -r "$tmp_req" >> /fizgig_setup.log 2>&1; then
         echo "[fizgig] dependencies installed successfully via uv pip" >> /fizgig_setup.log
-        touch "$FIZGIG_VENV/.isolated_torch_linked"
+        install_ok=1
       else
         echo "[fizgig][warn] uv pip install failed, attempting pip fallback..." >> /fizgig_setup.log
-        env DISABLE_CUDA=1 \
+        if env DISABLE_CUDA=1 \
           "$FIZGIG_VENV/bin/python" -m pip install \
             --no-build-isolation \
             "${constraint_args[@]}" \
-            -r "$tmp_req" >> /fizgig_setup.log 2>&1 || true
+            -r "$tmp_req" >> /fizgig_setup.log 2>&1; then
+          echo "[fizgig] dependencies installed successfully via pip fallback" >> /fizgig_setup.log
+          install_ok=1
+        else
+          echo "[fizgig][error] both uv and pip dependency installation failed!" >> /fizgig_setup.log
+        fi
+      fi
+
+      if [[ "$install_ok" == "1" ]]; then
         touch "$FIZGIG_VENV/.isolated_torch_linked"
+      else
+        echo "[fizgig][error] dependency installation failed; aborting preparation" >> /fizgig_setup.log
+        rm -f "$lock_file" 2>/dev/null || true
+        set -e
+        return 1
       fi
     fi
   else
@@ -1038,13 +1083,14 @@ prefs_file.write_text(json.dumps(prefs, indent=2), encoding="utf-8")
 print("[fizgig] updated prefs.json with ComfyUI shared models and loras output dir")
 PY
 
-  if [[ -f "$FIZGIG_VENV/.isolated_torch_linked" ]]; then
+  if is_fizgig_venv_healthy; then
+    touch "$FIZGIG_VENV/.isolated_torch_linked"
     touch "$FIZGIG_DIR/.prepared"
     touch /tmp/fizgig_prep.done
     echo "[fizgig] preparation complete and verified." >> /fizgig_setup.log
   else
-    echo "[fizgig][error] preparation finished with errors; dependencies not verified." >> /fizgig_setup.log
-    rm -f "$lock_file" 2>/dev/null || true
+    echo "[fizgig][error] preparation finished but venv health check failed (missing dependencies)." >> /fizgig_setup.log
+    rm -f "/tmp/fizgig_prep.done" "$FIZGIG_DIR/.prepared" "$FIZGIG_VENV/.isolated_torch_linked" "$lock_file" 2>/dev/null || true
     set -e
     return 1
   fi
@@ -1970,6 +2016,7 @@ launch_comfyui_runtime() {
 
 launch_fizgig_runtime() {
   if ! prepare_fizgig_runtime; then
+    echo "[fizgig][error] prepare_fizgig_runtime failed; cannot start UI" >> /fizgig_setup.log
     return 1
   fi
   if [[ -n "${FIZGIG_PLACEHOLDER_PID:-}" ]]; then
@@ -1994,6 +2041,7 @@ launch_fizgig_runtime() {
 }
 
 export -f is_pid_alive
+export -f is_fizgig_venv_healthy
 export -f placeholder_running
 export -f stop_placeholder_process
 export -f pip_install
@@ -2056,6 +2104,10 @@ start_fizgig_app_process() {
   sleep 2
   if ! process_running "${FIZGIG_APP_PID:-}"; then
     echo "[fizgig][warn] fizgig process exited immediately; backing off before restart" >> /fizgig_setup.log 2>&1 || true
+    if [[ -f /fizgig_ui.log ]]; then
+      echo "[fizgig][error] last /fizgig_ui.log lines:" >> /fizgig_setup.log
+      tail -n 25 /fizgig_ui.log >> /fizgig_setup.log 2>&1 || true
+    fi
     sleep 5
   fi
 }
