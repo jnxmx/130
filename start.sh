@@ -655,6 +655,17 @@ FIZGIG_UI_PORT="${FIZGIG_UI_PORT:-8081}"
 FIZGIG_UPDATE="${FIZGIG_UPDATE:-1}"
 FIZGIG_APP_PID=""
 
+run_model_sync() {
+  local sync_script="/scripts/sync_comfy_fizgig_models.py"
+  if [[ ! -f "$sync_script" && -f "/workspace/scripts/sync_comfy_fizgig_models.py" ]]; then
+    sync_script="/workspace/scripts/sync_comfy_fizgig_models.py"
+  fi
+  if [[ -f "$sync_script" ]]; then
+    python3 "$sync_script" /workspace 2>&1 | tee -a /fizgig_setup.log || true
+  fi
+}
+export -f run_model_sync
+
 # Temporary log page on Fizgig port until UI starts
 start_fizgig_startup_placeholder() {
   if placeholder_running "${FIZGIG_PLACEHOLDER_PID:-}"; then
@@ -972,13 +983,22 @@ PY
     echo "[fizgig] isolated venv and requirements already up to date (${new_commit:0:7})" >> /fizgig_setup.log
   fi
 
-  # 4. Patch Fizgig to disable password authentication and allow web access via proxy
+  # 4. Patch Fizgig to disable password authentication and link ComfyUI models
   FIZGIG_DIR="$FIZGIG_DIR" python3 - <<'PY' >> /fizgig_setup.log 2>&1
-import os, re
+import os, re, shutil
 from pathlib import Path
 
-fizgig_dir = os.environ.get("FIZGIG_DIR", "/workspace/Fizgig")
-server_file = Path(fizgig_dir) / "src" / "fizgig" / "web" / "server.py"
+fizgig_dir = Path(os.environ.get("FIZGIG_DIR", "/workspace/Fizgig"))
+
+# Install comfy_sync helper into fizgig package
+comfy_sync_src = Path("/scripts/sync_comfy_fizgig_models.py")
+comfy_sync_dest = fizgig_dir / "src" / "fizgig" / "comfy_sync.py"
+if comfy_sync_src.is_file():
+    comfy_sync_dest.parent.mkdir(parents=True, exist_ok=True)
+    comfy_sync_dest.write_text(comfy_sync_src.read_text(encoding="utf-8"), encoding="utf-8")
+    print("[fizgig] installed comfy_sync helper into fizgig package")
+
+server_file = fizgig_dir / "src" / "fizgig" / "web" / "server.py"
 if server_file.is_file():
     text = server_file.read_text(encoding="utf-8")
     # Patch _logged_in to always return True
@@ -1000,88 +1020,94 @@ if server_file.is_file():
     text = text.replace('Handler.local_only = not password', 'Handler.local_only = False')
     if 'a.password = None' not in text:
         text = text.replace('a = ap.parse_args(argv)', 'a = ap.parse_args(argv)\n    a.password = None')
+
+    # Hook _fetch_on_use in server.py to save models directly to ComfyUI models directory
+    if "from fizgig.comfy_sync import get_comfy_target" not in text:
+        target_srv = "os.replace(got, dest)             # a file in a repo subfolder: to the models folder itself\n            update_prefs({f.pref_key: dest})"
+        replacement_srv = """os.replace(got, dest)             # a file in a repo subfolder: to the models folder itself
+            try:
+                from fizgig.comfy_sync import get_comfy_target
+                comfy_dest = get_comfy_target(f.pref_key, getattr(f, "path", ""), os.path.basename(dest))
+                if comfy_dest and os.path.abspath(dest) != os.path.abspath(comfy_dest):
+                    import shutil
+                    os.makedirs(os.path.dirname(comfy_dest), exist_ok=True)
+                    if os.path.exists(comfy_dest):
+                        try: os.remove(comfy_dest)
+                        except OSError: pass
+                    shutil.move(dest, comfy_dest)
+                    if not os.path.exists(dest) and not os.path.islink(dest):
+                        try: os.symlink(comfy_dest, dest)
+                        except OSError: pass
+                    dest = comfy_dest
+            except Exception:
+                pass
+            update_prefs({f.pref_key: dest})"""
+        if target_srv in text:
+            text = text.replace(target_srv, replacement_srv, 1)
+            print("[fizgig] hooked _fetch_on_use in server.py to link ComfyUI models")
+
     server_file.write_text(text, encoding="utf-8")
-    print("[fizgig] password authentication and host check disabled in server.py")
+    print("[fizgig] password authentication, host check, and model link patched in server.py")
+
+fetch_models_file = fizgig_dir / "src" / "fizgig" / "scripts" / "fetch_models.py"
+if fetch_models_file.is_file():
+    fm_text = fetch_models_file.read_text(encoding="utf-8")
+    if "from fizgig.comfy_sync import get_comfy_target" not in fm_text:
+        target_check = "if os.path.isfile(dest) and _valid_safetensors(dest, min_bytes):"
+        replacement_check = """    try:
+        from fizgig.comfy_sync import get_comfy_target
+        comfy_dest = get_comfy_target(w.pref_key, getattr(w, "path_in_repo", ""), w.filename)
+        if comfy_dest and os.path.isfile(comfy_dest) and _valid_safetensors(comfy_dest, min_bytes):
+            if not os.path.exists(dest) and not os.path.islink(dest):
+                try: os.symlink(comfy_dest, dest)
+                except OSError: pass
+            log(f"  [have] {w.filename} — found in ComfyUI models, linking into Preferences")
+            prefs[w.pref_key] = comfy_dest
+            return True
+    except Exception:
+        comfy_dest = None
+
+    if os.path.isfile(dest) and _valid_safetensors(dest, min_bytes):"""
+        if target_check in fm_text:
+            fm_text = fm_text.replace(target_check, replacement_check, 1)
+
+        target_save = 'prefs[w.pref_key] = dest\n    log(f"  [done] {w.filename}")'
+        replacement_save = """    try:
+        from fizgig.comfy_sync import get_comfy_target
+        comfy_dest = get_comfy_target(w.pref_key, getattr(w, "path_in_repo", ""), w.filename)
+        if comfy_dest and os.path.abspath(dest) != os.path.abspath(comfy_dest):
+            import shutil
+            os.makedirs(os.path.dirname(comfy_dest), exist_ok=True)
+            if os.path.exists(comfy_dest):
+                try: os.remove(comfy_dest)
+                except OSError: pass
+            shutil.move(dest, comfy_dest)
+            if not os.path.exists(dest) and not os.path.islink(dest):
+                try: os.symlink(comfy_dest, dest)
+                except OSError: pass
+            dest = comfy_dest
+            log(f"  [comfy] moved {w.filename} -> {comfy_dest}")
+    except Exception as e:
+        log(f"  [warn] failed linking {w.filename} to ComfyUI: {e}")
+
+    prefs[w.pref_key] = dest
+    log(f"  [done] {w.filename}")"""
+        if target_save in fm_text:
+            fm_text = fm_text.replace(target_save, replacement_save, 1)
+
+        fetch_models_file.write_text(fm_text, encoding="utf-8")
+        print("[fizgig] hooked fetch_weight in fetch_models.py to link ComfyUI models")
 PY
 
   # 5. Shared model directories & preferences configuration
   echo "[fizgig] configuring shared models with ComfyUI..." >> /fizgig_setup.log
-  mkdir -p "$FIZGIG_DIR/user_data"
-  # Symlink user_data/models to /workspace/models
-  if [[ ! -L "$FIZGIG_DIR/user_data/models" ]]; then
-    rm -rf "$FIZGIG_DIR/user_data/models" 2>/dev/null || true
+  mkdir -p "$FIZGIG_DIR/user_data" /workspace/models
+  # Symlink user_data/models to /workspace/models if needed
+  if [[ ! -L "$FIZGIG_DIR/user_data/models" && ! -d "$FIZGIG_DIR/user_data/models" ]]; then
     ln -s /workspace/models "$FIZGIG_DIR/user_data/models" 2>/dev/null || true
   fi
 
-  # Configure prefs.json to link ComfyUI model directories and output LoRAs
-  FIZGIG_DIR="$FIZGIG_DIR" python3 - <<'PY' >> /fizgig_setup.log 2>&1
-import json, os
-from pathlib import Path
-
-fizgig_dir = Path(os.environ.get("FIZGIG_DIR", "/workspace/Fizgig"))
-prefs_file = fizgig_dir / "user_data" / "prefs.json"
-prefs_file.parent.mkdir(parents=True, exist_ok=True)
-
-prefs = {}
-if prefs_file.is_file():
-    try:
-        prefs = json.loads(prefs_file.read_text(encoding="utf-8"))
-    except Exception:
-        prefs = {}
-
-# Set shared output directory to ComfyUI LoRAs
-prefs["lora_output_dir"] = "/workspace/ComfyUI/models/loras"
-prefs["input_dataset_dir"] = "/workspace/datasets"
-prefs["profiles_dir"] = "/workspace/profiles"
-prefs["cache_dir"] = "/workspace/cache"
-prefs["web_password"] = ""
-
-# Model file mappings between Fizgig keys and ComfyUI folders/filenames
-model_map = {
-    "minimax_dit": ("diffusion_models", "minimax_h3_fl2va_pruned_int8_convrot.safetensors"),
-    "minimax_ref_dit": ("diffusion_models", "minimax_h3_ref2va_pruned_int8_convrot.safetensors"),
-    "minimax_text_encoder": ("text_encoders", "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"),
-    "minimax_vae": ("vae", "minimax_h3_video_vae_fp16.safetensors"),
-    "minimax_audio_vae": ("vae", "minimax_h3_audio_vae_fp32.safetensors"),
-    "minimax_turbo_lora": ("loras", "minimax_h3_turbo_v4_step600.safetensors"),
-    "minimax_circlestone_adapter": ("loras", "minimax_h3_image_training_adapter.safetensors"),
-    "minimax_training_adapter": ("loras", "minimax_h3_training_adapter_v1.safetensors"),
-    "minimax_ref_training_adapter": ("loras", "minimax_h3_ref2va_training_adapter_v1.safetensors"),
-    "krea2_text_encoder": ("text_encoders", "qwen3vl_4b_fp8_scaled.safetensors"),
-    "base_dit": ("diffusion_models", "flux-2-klein-base-9b-fp8.safetensors"),
-    "distilled_dit": ("diffusion_models", "flux-2-klein-9b-fp8.safetensors"),
-    "text_encoder": ("text_encoders", "qwen_3_8b.safetensors"),
-    "vae": ("vae", "ae.safetensors"),
-}
-
-search_roots = [
-    Path("/workspace/ComfyUI/models"),
-    Path("/Comfy/models"),
-    Path("/workspace/models"),
-]
-
-for key, (subfolder, filename) in model_map.items():
-    current_val = prefs.get(key)
-    if current_val and os.path.isfile(current_val):
-        continue
-    found_path = None
-    for root in search_roots:
-        candidate = root / subfolder / filename
-        if candidate.is_file():
-            found_path = str(candidate)
-            break
-        candidate_flat = root / filename
-        if candidate_flat.is_file():
-            found_path = str(candidate_flat)
-            break
-    if found_path:
-        prefs[key] = found_path
-    elif not prefs.get(key):
-        prefs[key] = f"/workspace/ComfyUI/models/{subfolder}/{filename}"
-
-prefs_file.write_text(json.dumps(prefs, indent=2), encoding="utf-8")
-print("[fizgig] updated prefs.json with ComfyUI shared models and loras output dir")
-PY
+  run_model_sync
 
   if is_fizgig_venv_healthy; then
     touch "$FIZGIG_VENV/.isolated_torch_linked"
@@ -1503,6 +1529,8 @@ if [[ -d /workspace/ComfyUI/models ]]; then
       -o /workspace/ComfyUI/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors || true
   fi
 fi
+
+run_model_sync
 
 migrate_manager_settings
 cleanup_legacy_manager
@@ -2224,10 +2252,12 @@ switch_to_app() {
   case "$target_app" in
     comfyui)
       set_app_runtime_state "comfyui" "comfyui" "starting-comfyui" "Starting ComfyUI"
+      run_model_sync
       start_comfy_app_process
       ;;
     fizgig)
       set_app_runtime_state "fizgig" "fizgig" "starting-fizgig" "Starting Fizgig"
+      run_model_sync
       start_fizgig_app_process
       ;;
   esac

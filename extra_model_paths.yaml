@@ -1,0 +1,16 @@
+# ComfyUI extra model paths configuration for Fizgig & Workspace
+fizgig_workspace:
+    base_path: /workspace/models
+    checkpoints: checkpoints
+    diffusion_models: diffusion_models
+    text_encoders: text_encoders
+    vae: vae
+    loras: loras
+
+fizgig_models:
+    base_path: /workspace/Fizgig/user_data/models
+    checkpoints: .
+    diffusion_models: .
+    text_encoders: .
+    vae: .
+    loras: .

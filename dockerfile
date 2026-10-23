@@ -168,6 +168,8 @@ COPY assets/ /usr/share/nginx/html/assets/
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY config.ini /Comfy/user/__manager/config.ini
 COPY config.ini /config.ini
+COPY extra_model_paths.yaml /Comfy/extra_model_paths.yaml
+COPY extra_model_paths.yaml /extra_model_paths.yaml
 COPY comfy.settings.json /Comfy/user/default/comfy.settings.json
 COPY scripts/ /scripts/
 COPY wheels/ /wheels/
