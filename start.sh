@@ -1234,6 +1234,11 @@ ensure_manager_policy_files() {
       local auto_fix_file="$manager_dir/pip_auto_fix.list"
       local config_file="$manager_dir/config.ini"
       mkdir -p "$manager_dir"
+      if [[ ! -f "$config_file" && -f "/Comfy/user/__manager/config.ini" ]]; then
+        cp "/Comfy/user/__manager/config.ini" "$config_file"
+      elif [[ ! -f "$config_file" && -f "/config.ini" ]]; then
+        cp "/config.ini" "$config_file"
+      fi
 
       MANAGER_BLACKLIST_FILE="$blacklist_file" python - <<'PY'
 from pathlib import Path
@@ -1297,10 +1302,19 @@ if current_policy != desired_update_policy:
     config["default"]["update_policy"] = desired_update_policy
     changed = True
 
+for key, val in [
+    ("allow_flagged_nodepack_install", "true"),
+    ("allow_git_url_install", "true"),
+    ("allow_pip_install", "true"),
+]:
+    if config["default"].get(key, "").strip().lower() != val:
+        config["default"][key] = val
+        changed = True
+
 if changed:
     with config_path.open("w", encoding="utf-8") as fh:
         config.write(fh)
-    print(f"[manager] updated {config_path} (use_uv={desired_uv}, update_policy={desired_update_policy})")
+    print(f"[manager] updated {config_path} (use_uv={desired_uv}, update_policy={desired_update_policy}, allow_flagged_nodepack_install=true)")
 PY
       MANAGER_AUTO_FIX_FILE="$auto_fix_file" python - <<'PY'
 from pathlib import Path

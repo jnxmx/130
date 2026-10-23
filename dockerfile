@@ -167,6 +167,7 @@ COPY 502.html /usr/share/nginx/html/502.html
 COPY assets/ /usr/share/nginx/html/assets/
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY config.ini /Comfy/user/__manager/config.ini
+COPY config.ini /config.ini
 COPY comfy.settings.json /Comfy/user/default/comfy.settings.json
 COPY scripts/ /scripts/
 COPY wheels/ /wheels/
