@@ -26,6 +26,7 @@ temp/
 !502.html
 !nginx.conf
 !config.ini
+!extra_model_paths.yaml
 !comfy.settings.json
 !assets/
 !assets/**
