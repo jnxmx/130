@@ -1792,7 +1792,143 @@ else
   fi
 fi
 
-# --- Optional first-boot restore (external scripts) ---
+# --- Optional first-boot restore (via ComfyUI_HuggingFace_Downloader's own backup.py API) ---
+find_hf_downloader_nodepack() {
+  local f
+  f="$(find /workspace/ComfyUI/custom_nodes -maxdepth 2 -name backup.py -path '*[Hh]ugging[Ff]ace_[Dd]ownloader*' -print -quit 2>/dev/null || true)"
+  [[ -n "$f" && -f "$(dirname "$f")/parse_link.py" ]] || return 1
+  dirname "$f"
+}
+
+# hfd_restore base|models
+#   base   -> nodepack restore_selected_from_huggingface() for everything except models/,
+#             then applies the snapshot it stages via ComfyUI-Manager (merged with current nodes,
+#             so nothing already installed gets disabled/downgraded).
+#   models -> same nodepack function, one file at a time (skips files already complete),
+#             clearing the HF cache after each file so disk usage never doubles.
+hfd_restore() {
+  (cd /workspace && COMFY_ROOT=/workspace/ComfyUI "$VIRTUAL_ENV/bin/python" - "$1" <<'PY'
+import importlib, os, shutil, subprocess, sys, types
+
+mode = sys.argv[1]
+comfy = os.environ["COMFY_ROOT"]
+node_dir = os.environ["HFD_NODE_DIR"]
+cache = os.path.join(comfy, "temp", "hfd_restore_cache")
+if mode == "models":
+    # must be set before huggingface_hub is imported
+    os.environ["HF_HUB_CACHE"] = cache
+
+# Load the nodepack as a package WITHOUT running its __init__ (which needs ComfyUI's server)
+pkg = "hfd_nodepack"
+m = types.ModuleType(pkg)
+m.__path__ = [node_dir]
+sys.modules[pkg] = m
+backup = importlib.import_module(pkg + ".backup")
+
+token, _ = backup.get_token_and_size_limit()
+if not token:
+    print("[restore][error] no HF token: set HF_TOKEN env or downloader.hf_token in comfy settings")
+    sys.exit(2)
+
+from huggingface_hub import HfApi
+api = HfApi(token=token)
+repo = backup._parse_repo_name(os.environ["COMFYUI_BACKUP"])
+files = [f for f in api.list_repo_files(repo_id=repo, token=token) if f.startswith("ComfyUI/")]
+MODELS = "ComfyUI/models/"
+SNAP = backup.CUSTOM_NODES_SNAPSHOT_PATH
+
+
+def apply_staged_snapshot():
+    import yaml
+    staged = os.path.join(comfy, "user", "__manager", "snapshots", os.path.basename(SNAP))
+    if not os.path.isfile(staged):
+        print("[restore] no staged custom nodes snapshot")
+        return
+    nodes_dir = os.path.join(comfy, "custom_nodes")
+    installed = {d.lower() for d in os.listdir(nodes_dir)} if os.path.isdir(nodes_dir) else set()
+
+    def strip(name):
+        name = name.rstrip("/").split("/")[-1].lower()
+        return name[:-4] if name.endswith(".git") else name
+
+    with open(staged, encoding="utf-8") as fh:
+        snap = yaml.safe_load(fh) or {}
+    missing_git = {u: v for u, v in (snap.get("git_custom_nodes") or {}).items()
+                   if strip(u) not in installed and strip(u).replace("_", "-") not in installed}
+    missing_cnr = {i: v for i, v in (snap.get("cnr_custom_nodes") or {}).items()
+                   if i.lower() not in installed and i.lower().replace("-", "_") not in installed}
+    if not missing_git and not missing_cnr:
+        print("[restore] all custom nodes from backup already installed")
+        return
+    print(f"[restore] installing {len(missing_git) + len(missing_cnr)} missing custom node(s) via ComfyUI-Manager")
+
+    cur_path = os.path.join(cache if mode == "models" else "/tmp", "hfd_current_snapshot.yaml")
+    merged_path = "/tmp/hfd_merged_snapshot.yaml"
+    env = dict(os.environ, PIP_NO_COMPILE="1")
+    cm_cli = next((p for p in (os.path.join(nodes_dir, "ComfyUI-Manager", "cm-cli.py"),
+                               os.path.join(nodes_dir, "comfyui-manager", "cm-cli.py")) if os.path.isfile(p)), None)
+    use_comfy = shutil.which("comfy") is not None
+
+    def run(args):
+        cmd = (["comfy", "--here", "--skip-prompt", "node"] + args) if use_comfy else [sys.executable, cm_cli] + args
+        return subprocess.run(cmd, cwd=comfy, env=env, check=False).returncode
+
+    if not use_comfy and not cm_cli:
+        print("[restore][warn] neither comfy-cli nor cm-cli found; snapshot left staged for Manager UI")
+        return
+    current = {}
+    if run(["save-snapshot", "--output", cur_path]) == 0 and os.path.isfile(cur_path):
+        with open(cur_path, encoding="utf-8") as fh:
+            current = yaml.safe_load(fh) or {}
+    merged = dict(current)
+    merged["git_custom_nodes"] = {**missing_git, **(current.get("git_custom_nodes") or {})}
+    merged["cnr_custom_nodes"] = {**missing_cnr, **(current.get("cnr_custom_nodes") or {})}
+    merged["pips"] = {}  # never let a backup re-pin pip packages (protects CUDA torch stack)
+    with open(merged_path, "w", encoding="utf-8") as fh:
+        yaml.safe_dump(merged, fh, sort_keys=False)
+    rc = run(["restore-snapshot", merged_path])
+    print(f"[restore] snapshot restore exit code {rc}")
+
+
+if mode == "base":
+    tops = sorted({"ComfyUI/" + f[len("ComfyUI/"):].split("/", 1)[0]
+                   for f in files if not f.startswith(MODELS) and f != SNAP})
+    selections = [{"kind": "paths", "paths": tops}] if tops else []
+    if SNAP in files:
+        selections.append({"kind": "custom_nodes_all"})
+    if selections:
+        print(backup.restore_selected_from_huggingface(repo, selections, target_dir=comfy))
+    apply_staged_snapshot()
+else:
+    sizes = {}
+    try:
+        for e in api.list_repo_tree(repo_id=repo, path_in_repo="ComfyUI/models", recursive=True, token=token):
+            if getattr(e, "size", None) is not None:
+                sizes[e.path] = e.size
+    except Exception as exc:
+        print(f"[restore][warn] could not read model sizes: {exc}")
+    failed = 0
+    model_files = sorted(f for f in files if f.startswith(MODELS))
+    print(f"[restore] {len(model_files)} model file(s) in backup")
+    for f in model_files:
+        dst = os.path.join(comfy, f[len("ComfyUI/"):])
+        if os.path.isfile(dst) and sizes.get(f) == os.path.getsize(dst):
+            continue
+        try:
+            print(f"[restore] {f}")
+            backup.restore_selected_from_huggingface(
+                repo, [{"kind": "path", "path": f, "entry_type": "file"}], target_dir=comfy)
+        except Exception as exc:
+            failed += 1
+            print(f"[restore][error] {f}: {exc}")
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
+    print(f"[restore] models done, {failed} failed")
+    sys.exit(1 if failed else 0)
+PY
+  )
+}
+
 echo "RESTORE_BACKUP: ${RESTORE_BACKUP:-}"
 echo "COMFYUI_BACKUP: ${COMFYUI_BACKUP:-}"
 RESTORE_JUST_RAN=0
@@ -1800,24 +1936,32 @@ if [[ "${RESTORE_BACKUP:-0}" == "1" && -n "${COMFYUI_BACKUP:-}" && -d "/workspac
   echo "[restore] first-boot restore enabled"
   echo "[INFO] First-boot restore from ${COMFYUI_BACKUP}…"
   pip_install "$VIRTUAL_ENV/bin/python" -q huggingface_hub PyYAML hf_transfer || true
-  
-  NEW_RESTORE_SCRIPT=""
-  if [[ -d "/workspace/ComfyUI/custom_nodes" ]]; then
-    NEW_RESTORE_SCRIPT="$(find /workspace/ComfyUI/custom_nodes -maxdepth 3 -name restore_backup.py -print -quit 2>/dev/null || true)"
-  fi
 
-  if [[ -n "$NEW_RESTORE_SCRIPT" && -f "$NEW_RESTORE_SCRIPT" ]]; then
-    echo "[restore] Running background model restoration via restore_backup.py..."
-    "$VIRTUAL_ENV/bin/python" "$NEW_RESTORE_SCRIPT" --only-models &> /restore.log &
-    echo "[restore] Running foreground nodes & settings restoration via restore_backup.py..."
-    "$VIRTUAL_ENV/bin/python" "$NEW_RESTORE_SCRIPT" --skip-models
+  if HFD_NODE_DIR="$(find_hf_downloader_nodepack)"; then
+    export HFD_NODE_DIR
+    echo "[restore] using nodepack restore API from $HFD_NODE_DIR"
+    echo "[restore] restoring user/input/settings + custom nodes (foreground)..."
+    if hfd_restore base; then
+      RESTORE_JUST_RAN=1
+      touch /workspace/.restore_done
+      echo "[restore] base restore complete"
+    else
+      echo "[restore][error] base restore failed; will retry on next boot (no .restore_done written)"
+    fi
   else
-    echo "[restore][warn] Restore script (restore_backup.py) not found. Skipping restore."
+    echo "[restore][warn] ComfyUI_HuggingFace_Downloader nodepack (backup.py) not found; skipping restore"
   fi
-  RESTORE_JUST_RAN=1
-  touch /workspace/.restore_done
 else
   echo "Backup restore skipped."
+fi
+
+# Models are restored in the background (resumable: re-runs on next boot until complete)
+if [[ "${RESTORE_BACKUP:-0}" == "1" && -n "${COMFYUI_BACKUP:-}" && -f "/workspace/.restore_done" && ! -f "/workspace/.restore_models_done" ]]; then
+  if HFD_NODE_DIR="$(find_hf_downloader_nodepack)"; then
+    export HFD_NODE_DIR
+    echo "[restore] restoring models in background (log: /restore.log)"
+    ( if hfd_restore models; then touch /workspace/.restore_models_done; run_model_sync; fi ) >> /restore.log 2>&1 &
+  fi
 fi
 
 # --- Restore comfy_course workflows when NOT in student mode ---
