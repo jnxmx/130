@@ -1162,7 +1162,7 @@ fi
 update_and_install_requirements() {
   cd "$1" || return
   local old="$(git rev-parse HEAD 2>/dev/null || echo)"
-  git pull --ff-only --quiet 2>/dev/null || git pull --ff-only 2>/dev/null || true
+  GIT_TERMINAL_PROMPT=0 git pull --ff-only --quiet 2>/dev/null || GIT_TERMINAL_PROMPT=0 git pull --ff-only 2>/dev/null || true
   local new="$(git rev-parse HEAD 2>/dev/null || echo)"
   if [[ "$old" != "$new" && -f requirements.txt ]]; then
     if git diff --quiet "$old" "$new" -- requirements.txt 2>/dev/null; then
@@ -1179,23 +1179,37 @@ update_comfyui_core() {
   cd "$target_dir" || return
   local old="$(git rev-parse HEAD 2>/dev/null || echo)"
 
-  echo "[updates] Fetching latest refs and tags for ComfyUI core..."
-  git fetch --all --tags origin 2>/dev/null || git fetch --all --tags 2>/dev/null || true
-
   if [[ "${NIGHTLY_COMFYUI:-0}" == "1" ]]; then
-    echo "[updates] NIGHTLY_COMFYUI=1; updating ComfyUI core to latest master commit"
-    git checkout -B master origin/master 2>/dev/null || git checkout master 2>/dev/null || true
-    git pull origin master --ff-only --quiet 2>/dev/null || git reset --hard origin/master 2>/dev/null || true
+    local remote_master=""
+    remote_master="$(GIT_TERMINAL_PROMPT=0 git ls-remote origin refs/heads/master 2>/dev/null | awk '{print $1}' | head -n 1 || true)"
+    if [[ -n "$remote_master" && "$old" == "$remote_master" ]]; then
+      echo "[updates] ComfyUI core already at latest master (${old:0:7}); skipping fetch"
+      return 0
+    fi
+    echo "[updates] NIGHTLY_COMFYUI=1; fetching latest ComfyUI master commit..."
+    GIT_TERMINAL_PROMPT=0 git fetch --depth 1 origin master --quiet 2>/dev/null || GIT_TERMINAL_PROMPT=0 git fetch origin master 2>/dev/null || true
+    git checkout -B master FETCH_HEAD 2>/dev/null || git reset --hard FETCH_HEAD 2>/dev/null || true
   else
-    echo "[updates] NIGHTLY_COMFYUI=0 (default); ensuring ComfyUI core is on latest stable release tag"
-    local latest_tag
-    latest_tag="$(git tag -l 'v[0-9]*' | sort -V | tail -n 1 2>/dev/null || true)"
+    local latest_tag=""
+    latest_tag="$(GIT_TERMINAL_PROMPT=0 git ls-remote --tags --refs origin 'v[0-9]*' 2>/dev/null | awk -F'refs/tags/' 'NF>1{print $2}' | sort -V | tail -n 1 || true)"
+    if [[ -z "$latest_tag" ]]; then
+      latest_tag="$(git tag -l 'v[0-9]*' | sort -V | tail -n 1 2>/dev/null || true)"
+    fi
     if [[ -z "$latest_tag" ]]; then
       latest_tag="$(git tag -l 'v*' | sort -V | tail -n 1 2>/dev/null || true)"
     fi
+
     if [[ -n "$latest_tag" ]]; then
-      echo "[updates] Checking out latest stable ComfyUI tag: ${latest_tag}"
-      git checkout -f "$latest_tag" 2>/dev/null || true
+      local local_tag_sha=""
+      local_tag_sha="$(git rev-parse -q --verify "refs/tags/${latest_tag}^{commit}" 2>/dev/null || true)"
+      if [[ -n "$local_tag_sha" && "$old" == "$local_tag_sha" ]]; then
+        echo "[updates] ComfyUI core already on latest stable tag ${latest_tag} (${old:0:7}); skipping fetch"
+        return 0
+      fi
+      echo "[updates] Updating ComfyUI core to latest stable tag: ${latest_tag}"
+      GIT_TERMINAL_PROMPT=0 git fetch --depth 1 origin "refs/tags/${latest_tag}:refs/tags/${latest_tag}" --quiet 2>/dev/null \
+        || GIT_TERMINAL_PROMPT=0 git fetch --tags origin 2>/dev/null || true
+      git checkout -f "$latest_tag" --quiet 2>/dev/null || git checkout -f "$latest_tag" 2>/dev/null || true
     else
       echo "[updates][warn] Could not determine latest tag; keeping current version"
     fi
@@ -1214,6 +1228,74 @@ update_comfyui_core() {
       echo "[deps] ComfyUI core is already at commit ${new:0:7}; requirements check skipped"
     fi
   fi
+}
+
+update_custom_nodes_parallel() {
+  local nodes_root="$1"
+  [[ -d "$nodes_root" ]] || return 0
+
+  local status_dir
+  status_dir="$(mktemp -d /tmp/comfy-node-updates.XXXXXX)"
+  local pids=()
+  local repo_dirs=()
+
+  for d in "$nodes_root"/*/; do
+    [[ -d "$d/.git" ]] || continue
+    repo_dirs+=("$d")
+    local idx="${#repo_dirs[@]}"
+    (
+      local old_sha new_sha
+      old_sha="$(git -C "$d" rev-parse HEAD 2>/dev/null || echo)"
+      GIT_TERMINAL_PROMPT=0 git -C "$d" pull --ff-only --quiet 2>/dev/null || true
+      new_sha="$(git -C "$d" rev-parse HEAD 2>/dev/null || echo)"
+      printf '%s\t%s\t%s\n' "$d" "$old_sha" "$new_sha" > "$status_dir/$idx.status"
+    ) &
+    pids+=("$!")
+  done
+
+  if [[ "${#pids[@]}" -eq 0 ]]; then
+    rm -rf "$status_dir"
+    return 0
+  fi
+
+  echo "[nodes] checking ${#pids[@]} custom node repositories in parallel..."
+  for pid in "${pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+
+  local updated_count=0
+  local up_to_date_count=0
+  local manager_updated=0
+  local f d old_sha new_sha node_name
+
+  for f in "$status_dir"/*.status; do
+    [[ -f "$f" ]] || continue
+    IFS=$'\t' read -r d old_sha new_sha < "$f"
+    node_name="$(basename "$d")"
+    if [[ -n "$old_sha" && -n "$new_sha" && "$old_sha" != "$new_sha" ]]; then
+      updated_count=$((updated_count + 1))
+      echo "[nodes] updated ${node_name} (${old_sha:0:7} -> ${new_sha:0:7})"
+      case "${node_name,,}" in
+        comfyui-manager) manager_updated=1 ;;
+      esac
+      if [[ -f "$d/requirements.txt" ]]; then
+        if git -C "$d" diff --quiet "$old_sha" "$new_sha" -- requirements.txt 2>/dev/null; then
+          echo "[deps] requirements.txt unchanged in ${node_name}; skipping reinstall"
+        else
+          echo "[deps] requirements.txt updated in ${node_name}; installing packages"
+          pip_install_requirements "$VIRTUAL_ENV/bin/python" "$d/requirements.txt" || true
+        fi
+      fi
+    else
+      up_to_date_count=$((up_to_date_count + 1))
+    fi
+  done
+
+  rm -rf "$status_dir"
+  if [[ "$manager_updated" -eq 1 ]]; then
+    patch_legacy_manager_blacklist_guard || true
+  fi
+  echo "[nodes] custom nodes check complete (${updated_count} updated, ${up_to_date_count} already up-to-date)"
 }
 
 migrate_manager_settings() {
@@ -1935,7 +2017,9 @@ RESTORE_JUST_RAN=0
 if [[ "${RESTORE_BACKUP:-0}" == "1" && -n "${COMFYUI_BACKUP:-}" && -d "/workspace/ComfyUI" && ! -f "/workspace/.restore_done" ]]; then
   echo "[restore] first-boot restore enabled"
   echo "[INFO] First-boot restore from ${COMFYUI_BACKUP}…"
-  pip_install "$VIRTUAL_ENV/bin/python" -q huggingface_hub PyYAML hf_transfer || true
+  if ! "$VIRTUAL_ENV/bin/python" -c "import huggingface_hub, yaml, hf_transfer" 2>/dev/null; then
+    pip_install "$VIRTUAL_ENV/bin/python" -q huggingface_hub PyYAML hf_transfer || true
+  fi
 
   if HFD_NODE_DIR="$(find_hf_downloader_nodepack)"; then
     export HFD_NODE_DIR
@@ -2032,36 +2116,7 @@ if [[ -d /workspace/ComfyUI ]]; then
     # Even after restore, refresh preinstalled and runtime custom nodes to the latest version.
     echo "STAGE: Updating ComfyUI and custom nodes"
     update_comfyui_core /workspace/ComfyUI || true
-
-    if command -v comfy >/dev/null 2>&1; then
-      # Use cache mode to reduce remote registry fetches; hide noisy cm-cli banners
-      tmp_log="$(mktemp)"
-      if (cd /workspace/ComfyUI && run_with_manager_pip_env comfy --here --skip-prompt node update all --mode cache) >"$tmp_log" 2>&1; then
-        comfy_status=0
-      else
-        comfy_status=$?
-      fi
-      grep -vE '^(Command: \[|Execute from: )' "$tmp_log" || true
-      rm -f "$tmp_log"
-      if [[ "$comfy_status" -ne 0 ]]; then
-        echo "[nodes][warn] comfy CLI update failed; falling back to git updates"
-        for d in /workspace/ComfyUI/custom_nodes/*/; do
-          if [[ -d "$d/.git" ]]; then
-            node_name="$(basename "$d")"
-            echo "[nodes] refreshing ${node_name}"
-            update_and_install_requirements "$d" || true
-          fi
-        done
-      fi
-    else
-      for d in /workspace/ComfyUI/custom_nodes/*/; do
-        if [[ -d "$d/.git" ]]; then
-          node_name="$(basename "$d")"
-          echo "[nodes] refreshing ${node_name}"
-          update_and_install_requirements "$d" || true
-        fi
-      done
-    fi
+    update_custom_nodes_parallel /workspace/ComfyUI/custom_nodes || true
   fi
 fi
 
