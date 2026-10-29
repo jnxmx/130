@@ -1,8 +1,0 @@
-# ComfyUI extra model paths configuration for Fizgig
-fizgig_models:
-    base_path: /workspace/Fizgig/user_data/models
-    checkpoints: .
-    diffusion_models: .
-    text_encoders: .
-    vae: .
-    loras: .

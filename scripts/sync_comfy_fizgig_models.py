@@ -351,7 +351,8 @@ def route_to_comfy(
 
     if dest_in_models_dir:
         abs_models_dest = os.path.abspath(dest_in_models_dir)
-        if abs_models_dest != abs_comfy:
+        subfolder = classify_model_file(fn, pref_key, repo_path)
+        if abs_models_dest != abs_comfy and subfolder in {"diffusion_models", "text_encoders", "vae", "loras", "checkpoints"}:
             ensure_symlink(Path(comfy_dest), Path(dest_in_models_dir))
 
     return comfy_dest
@@ -723,6 +724,7 @@ def sync_all(workspace_dir: str = "/workspace") -> dict[str, int]:
     _migrate_directory_contents(ws / "output_loras", comfy_models / "loras")
 
     # 4. Migrate any real model files in /workspace/Fizgig/user_data/models/ into /workspace/ComfyUI/models/<subfolder>/
+    fizgig_shared_subfolders = ("diffusion_models", "text_encoders", "vae", "loras", "checkpoints")
     if fizgig_models.is_dir():
         for f in list(fizgig_models.iterdir()):
             if f.is_file() and not f.is_symlink() and f.suffix.lower() in VALID_MODEL_EXTENSIONS:
@@ -741,13 +743,54 @@ def sync_all(workspace_dir: str = "/workspace") -> dict[str, int]:
                         f.unlink()
                     except OSError:
                         pass
-                ensure_symlink(target, f)
+                if subfolder in fizgig_shared_subfolders:
+                    ensure_symlink(target, f)
 
-    # 5. Create symlinks in /workspace/Fizgig/user_data/models/ for every model found in ComfyUI
-    for sub in comfy_models.iterdir():
+    # 4b. Clean up any misplaced vae_approx or latent_upscale_models files from other ComfyUI subfolders
+    exclusive_files = {
+        "taew2_1.safetensors": "vae_approx",
+        "taeh3.safetensors": "vae_approx",
+        "minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors": "latent_upscale_models",
+    }
+    for fname, correct_sub in exclusive_files.items():
+        correct_target = comfy_models / correct_sub / fname
+        for sub in comfy_models.iterdir():
+            if not sub.is_dir() or sub.name == correct_sub:
+                continue
+            wrong_path = sub / fname
+            if wrong_path.exists() or wrong_path.is_symlink():
+                if not correct_target.exists() and wrong_path.is_file() and not wrong_path.is_symlink():
+                    correct_target.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        shutil.move(str(wrong_path), str(correct_target))
+                        continue
+                    except OSError:
+                        pass
+                try:
+                    wrong_path.unlink()
+                    print(f"[model_sync] Removed misplaced {fname} from ComfyUI models/{sub.name}/")
+                except OSError:
+                    pass
+
+    # 5. Clean non-Fizgig symlinks in /workspace/Fizgig/user_data/models/ and link only Fizgig-relevant ComfyUI subfolders
+    if fizgig_models.is_dir():
+        for item in list(fizgig_models.iterdir()):
+            if item.is_symlink():
+                try:
+                    resolved = item.resolve()
+                    if not resolved.exists() or resolved.parent.name not in fizgig_shared_subfolders or item.name in exclusive_files:
+                        item.unlink()
+                except OSError:
+                    try:
+                        item.unlink()
+                    except OSError:
+                        pass
+
+    for sub_name in fizgig_shared_subfolders:
+        sub = comfy_models / sub_name
         if sub.is_dir():
             for f in sub.iterdir():
-                if f.is_file() and f.suffix.lower() in VALID_MODEL_EXTENSIONS:
+                if f.is_file() and f.suffix.lower() in VALID_MODEL_EXTENSIONS and f.name not in exclusive_files:
                     if ensure_symlink(f, fizgig_models / f.name):
                         linked += 1
 
@@ -817,20 +860,15 @@ def sync_all(workspace_dir: str = "/workspace") -> dict[str, int]:
     # 7. Patch Fizgig sources so any runtime downloads go straight to ComfyUI models
     patch_fizgig_sources(fizgig_dir)
 
-    # 8. Ensure extra_model_paths.yaml in ComfyUI points to /workspace/Fizgig/user_data/models as fallback
-    extra_yaml_content = """# ComfyUI extra model paths configuration for Fizgig
-fizgig_models:
-    base_path: /workspace/Fizgig/user_data/models
-    checkpoints: .
-    diffusion_models: .
-    text_encoders: .
-    vae: .
-    loras: .
-"""
-    for ypath in [comfy_root / "extra_model_paths.yaml", Path("/Comfy/extra_model_paths.yaml")]:
+    # 8. Remove legacy extra_model_paths.yaml that mapped all ComfyUI model categories to the flat
+    # /workspace/Fizgig/user_data/models directory (which caused cross-category pollution and duplicate entries).
+    for ypath in [comfy_root / "extra_model_paths.yaml", Path("/Comfy/extra_model_paths.yaml"), Path("/extra_model_paths.yaml")]:
         try:
-            if ypath.parent.is_dir():
-                ypath.write_text(extra_yaml_content, encoding="utf-8")
+            if ypath.is_file() or ypath.is_symlink():
+                content = ypath.read_text(encoding="utf-8", errors="ignore") if ypath.is_file() else ""
+                if "fizgig_models" in content or "/workspace/Fizgig/user_data/models" in content or not content.strip():
+                    ypath.unlink()
+                    print(f"[model_sync] Removed legacy flat-directory {ypath}")
         except OSError:
             pass
 
