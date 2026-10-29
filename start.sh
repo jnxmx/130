@@ -342,6 +342,172 @@ raise SystemExit(0 if result["ok"] else 1)
 PY
 }
 
+# --- Workspace volume preflight helper ---
+# Returns JSON with status:
+#   - "no_volume"     (exit 2): /workspace is not mounted (sits on root container overlay /)
+#   - "global_volume" (exit 0): RunPod Global Volume detected at /workspace or /workspace-global
+#   - "volume_disk"   (exit 0): normal Pod Volume Disk or regional Network Volume mounted at /workspace
+volume_probe_json() {
+  python - <<'PY'
+import json
+import os
+import stat
+
+forced = (os.environ.get("FORCE_VOLUME_STATE") or "").strip().lower()
+skip = (os.environ.get("SKIP_VOLUME_CHECK") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+result = {
+    "status": "volume_disk",
+    "mounted": False,
+    "global_volume": False,
+    "mountpoint": "/workspace",
+    "source": None,
+    "fstype": None,
+    "options": None,
+    "total_gb": None,
+    "reason": None,
+}
+
+if skip:
+    result["mounted"] = True
+    result["reason"] = "SKIP_VOLUME_CHECK enabled"
+    print(json.dumps(result, ensure_ascii=False))
+    raise SystemExit(0)
+
+if forced in {"no_volume", "global_volume", "volume_disk"}:
+    result["status"] = forced
+    result["mounted"] = forced != "no_volume"
+    result["global_volume"] = forced == "global_volume"
+    result["reason"] = f"FORCE_VOLUME_STATE={forced}"
+    print(json.dumps(result, ensure_ascii=False))
+    raise SystemExit(2 if forced == "no_volume" else 0)
+
+os.makedirs("/workspace", exist_ok=True)
+
+mounts = {}
+try:
+    with open("/proc/mounts", "r", encoding="utf-8", errors="ignore") as fh:
+        for raw_line in fh:
+            parts = raw_line.split()
+            if len(parts) >= 4:
+                src, mnt, fstype, opts = parts[0], parts[1].replace("\\040", " "), parts[2], parts[3]
+                mounts[mnt] = {"source": src, "fstype": fstype, "options": opts}
+except OSError:
+    pass
+
+ws_mount = mounts.get("/workspace")
+ws_global_mount = mounts.get("/workspace-global")
+
+try:
+    same_dev_as_root = os.stat("/workspace").st_dev == os.stat("/").st_dev
+except OSError:
+    same_dev_as_root = False
+
+is_mounted = bool(ws_mount is not None or os.path.ismount("/workspace") or not same_dev_as_root)
+result["mounted"] = is_mounted
+
+if ws_mount:
+    result["source"] = ws_mount.get("source")
+    result["fstype"] = ws_mount.get("fstype")
+    result["options"] = ws_mount.get("options")
+
+try:
+    st_vfs = os.statvfs("/workspace")
+    total_bytes = st_vfs.f_frsize * st_vfs.f_blocks
+    if total_bytes > 0:
+        result["total_gb"] = round(total_bytes / (1024 ** 3), 2)
+except OSError:
+    total_bytes = 0
+
+if not is_mounted and ws_global_mount is None:
+    result["status"] = "no_volume"
+    result["reason"] = "/workspace is not a mounted volume (resides on container root filesystem /)"
+    print(json.dumps(result, ensure_ascii=False))
+    raise SystemExit(2)
+
+# Check if a RunPod Global Volume is being used
+global_reasons = []
+
+if ws_global_mount is not None or os.path.ismount("/workspace-global"):
+    global_reasons.append("/workspace-global mountpoint present")
+
+for env_key, env_val in os.environ.items():
+    k_upper = env_key.upper()
+    if "GLOBAL_VOLUME" in k_upper and str(env_val).strip().lower() not in {"", "0", "false", "no"}:
+        global_reasons.append(f"env {env_key} is set")
+
+src_l = (result["source"] or "").lower()
+fs_l = (result["fstype"] or "").lower()
+opts_l = (result["options"] or "").lower()
+combined_sig = f"{src_l} {fs_l} {opts_l}"
+
+is_moosefs = ("mfs" in src_l) or ("mfs" in fs_l) or ("mfsmaster" in opts_l)
+global_tokens = (
+    "global",
+    "geesefs",
+    "goofys",
+    "s3fs",
+    "mountpoint-s3",
+    "rclone",
+    "tigris",
+    "juicefs",
+    "objfs",
+    "gcsfuse",
+    "blobfuse",
+)
+if any(tok in combined_sig for tok in global_tokens):
+    global_reasons.append(f"mount signature matches object/global storage ({result['source']}:{result['fstype']})")
+
+# RunPod Global Volumes are FUSE-mounted object storage with two documented POSIX limitations:
+# 1. "No permission bits: Global volumes cannot set file permission bits."
+# 2. "Limited POSIX semantics: Global volumes do not support file locking, atomic rename, or hard links."
+probe_dir = "/workspace-global" if (ws_global_mount is not None and os.path.isdir("/workspace-global")) else "/workspace"
+probe_file = os.path.join(probe_dir, f".runpod_vol_probe_{os.getpid()}")
+probe_link = f"{probe_file}.hl"
+chmod_supported = True
+hardlink_supported = True
+try:
+    with open(probe_file, "wb") as pf:
+        pf.write(b"1")
+    try:
+        os.chmod(probe_file, 0o600)
+        mode_600 = stat.S_IMODE(os.stat(probe_file).st_mode)
+        os.chmod(probe_file, 0o755)
+        mode_755 = stat.S_IMODE(os.stat(probe_file).st_mode)
+        if mode_600 == mode_755:
+            chmod_supported = False
+    except OSError:
+        chmod_supported = False
+
+    try:
+        os.link(probe_file, probe_link)
+    except OSError:
+        hardlink_supported = False
+except OSError:
+    pass
+finally:
+    for p in (probe_link, probe_file):
+        try:
+            if os.path.lexists(p):
+                os.unlink(p)
+        except OSError:
+            pass
+
+if not chmod_supported and not hardlink_supported:
+    global_reasons.append("filesystem does not support POSIX permission bits (chmod) or hard links (Global Volume object storage)")
+elif "fuse" in fs_l and not is_moosefs and (not chmod_supported or not hardlink_supported):
+    global_reasons.append(f"FUSE mount ({result['fstype']}) lacks POSIX chmod/hardlink support")
+
+if global_reasons:
+    result["status"] = "global_volume"
+    result["global_volume"] = True
+    result["reason"] = "; ".join(global_reasons)
+
+print(json.dumps(result, ensure_ascii=False))
+raise SystemExit(0)
+PY
+}
+
 # --- CPU confirm state (used by wait page and launch gate) ---
 PIN_CORES=""
 CPU_CONFIRM_REQUIRED=0
@@ -623,6 +789,55 @@ EOF
   start_comfy_placeholder || true
   ensure_nginx_started || true
   keep_comfy_wait_stack_alive_forever
+fi
+
+# --- Workspace volume preflight (halt if no volume mounted; warn if Global Volume) ---
+echo "STAGE: Checking workspace volume"
+VOLUME_DIAG=""
+VOLUME_RC=0
+VOLUME_DIAG="$(volume_probe_json 2>&1)" || VOLUME_RC=$?
+echo "[volume] probe result (rc=${VOLUME_RC}): ${VOLUME_DIAG}"
+
+if [[ "$VOLUME_RC" == "2" ]] || [[ "$VOLUME_DIAG" == *'"status": "no_volume"'* ]]; then
+  cat << 'EOF'
+  ███╗   ██╗ ██████╗     ██╗   ██╗ ██████╗ ██╗     ██╗   ██╗███╗   ███╗███████╗
+  ████╗  ██║██╔═══██╗    ██║   ██║██╔═══██╗██║     ██║   ██║████╗ ████║██╔════╝
+  ██╔██╗ ██║██║   ██║    ██║   ██║██║   ██║██║     ██║   ██║██╔████╔██║█████╗  
+  ██║╚██╗██║██║   ██║    ╚██╗ ██╔╝██║   ██║██║     ██║   ██║██║╚██╔╝██║██╔══╝  
+  ██║ ╚████║╚██████╔╝     ╚████╔╝ ╚██████╔╝███████╗╚██████╔╝██║ ╚═╝ ██║███████╗
+  ╚═╝  ╚═══╝ ╚═════╝       ╚═══╝   ╚═════╝ ╚══════╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝
+
+        no Volume Disk is mounted at /workspace — deployment halted
+     edit this pod in RunPod to add a 200 GB Volume Disk at /workspace
+
+EOF
+  echo "No volume disk mounted at /workspace: ${VOLUME_DIAG}" >> ~/comfyui_error.log
+  echo "STAGE: No volume disk mounted"
+  echo "[fatal][volume] No Volume Disk is mounted at /workspace. Due to recent RunPod changes, pods can spawn without a Volume Disk attached automatically, so deployment has been stopped."
+  echo "[fatal][volume_action] How to edit your Pod to add a Volume Disk: 1) Open RunPod Console (https://console.runpod.io/pods). 2) Click the three dots (...) next to this Pod and select 'Edit Pod'. 3) Set 'Volume Disk' to 200 GB (Mount Path: /workspace). 4) Click 'Save' to restart the Pod with the volume attached."
+  echo "[fatal][volume_ru] В /workspace не примонтирован диск тома (Volume Disk). Из-за новых функций RunPod диск тома может не создаваться автоматически вместе с подом, поэтому развёртывание остановлено. Как отредактировать под и добавить Volume Disk: 1) Откройте RunPod Console (https://console.runpod.io/pods). 2) Нажмите на три точки (...) рядом с этим подом и выберите «Edit Pod». 3) Укажите размер «Volume Disk» 200 GB (путь монтирования: /workspace). 4) Нажмите «Save», чтобы перезапустить под с диском."
+  echo "[fatal][agent_action] AGENT DEPLOYMENT INSTRUCTION: No Volume Disk is mounted at /workspace and deployment is stopped. Propose to the user to add 200 GB of Volume Disk space to this pod at /workspace (edit/update the pod with Volume Disk = 200 GB mounted at /workspace, or redeploy with 200 GB volume disk)."
+  echo "[fatal][volume_diag] ${VOLUME_DIAG}"
+  start_comfy_placeholder || true
+  ensure_nginx_started || true
+  keep_comfy_wait_stack_alive_forever
+elif [[ "$VOLUME_DIAG" == *'"status": "global_volume"'* ]]; then
+  cat << 'EOF'
+  ================================================================================
+  WARNING: RUNPOD GLOBAL VOLUME IN USE ($0.10/GB/MONTH ONGOING CHARGE)
+  --------------------------------------------------------------------------------
+  A Global Volume is mounted in place of a local Pod Volume Disk.
+  Deployment will continue normally, but remember:
+  Global Volumes are NOT automatically deleted when you terminate this Pod!
+  If you do not manually delete the Global Volume after use, RunPod will continue
+  charging you $0.10/GB/month (10c/GB).
+  ================================================================================
+EOF
+  echo "[warn][global_volume] A RunPod Global Volume is being used in place of a Pod Volume Disk."
+  echo "[warn][global_volume_action] If you do not manually delete the Global Volume after terminating this Pod, RunPod will continue charging you \$0.10/GB/month (10c/GB). Deployment is continuing normally."
+  echo "[warn][global_volume_ru] Вместо обычного Volume Disk используется Global Volume. Развёртывание продолжается в штатном режиме, но помните: Global Volume НЕ удаляется автоматически вместе с подом! Если вы не удалите Global Volume вручную после завершения работы, RunPod будет продолжать списывать 10 центов за ГБ в месяц (\$0.10/GB)."
+  echo "[warn][global_volume_agent] AGENT DEPLOYMENT WARNING: A RunPod Global Volume is utilized in place of a Pod Volume Disk. Do NOT stop deployment, but warn the user during deploy that Global Volumes are not deleted when the pod is terminated and RunPod will charge \$0.10/GB/month (10c/GB) if they do not delete the Global Volume afterward."
+  echo "[warn][global_volume_diag] ${VOLUME_DIAG}"
 fi
 
 # --- CPU preflight (warn + confirm on overload) ---

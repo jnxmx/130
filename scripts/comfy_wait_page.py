@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 import argparse
 import http.server
 import importlib
@@ -50,6 +50,16 @@ RESTORE_APPLY_RE = re.compile(r"\[restore\]\s+restoring nodes from merged snapsh
 FATAL_GPU_RE = re.compile(r"\[fatal\]\[gpu\]\s*(.+)", re.I)
 FATAL_GPU_DIAG_RE = re.compile(r"\[fatal\]\[gpu_diag\]\s*(.+)", re.I)
 FATAL_ACTION_RE = re.compile(r"\[fatal\]\[action\]\s*(.+)", re.I)
+FATAL_VOLUME_RE = re.compile(r"\[fatal\]\[volume\]\s*(.+)", re.I)
+FATAL_VOLUME_ACTION_RE = re.compile(r"\[fatal\]\[volume_action\]\s*(.+)", re.I)
+FATAL_VOLUME_RU_RE = re.compile(r"\[fatal\]\[volume_ru\]\s*(.+)", re.I)
+FATAL_AGENT_ACTION_RE = re.compile(r"\[fatal\]\[agent_action\]\s*(.+)", re.I)
+FATAL_VOLUME_DIAG_RE = re.compile(r"\[fatal\]\[volume_diag\]\s*(.+)", re.I)
+WARN_GLOBAL_VOLUME_RE = re.compile(r"\[warn\]\[global_volume\]\s*(.+)", re.I)
+WARN_GLOBAL_VOLUME_ACTION_RE = re.compile(r"\[warn\]\[global_volume_action\]\s*(.+)", re.I)
+WARN_GLOBAL_VOLUME_RU_RE = re.compile(r"\[warn\]\[global_volume_ru\]\s*(.+)", re.I)
+WARN_GLOBAL_VOLUME_AGENT_RE = re.compile(r"\[warn\]\[global_volume_agent\]\s*(.+)", re.I)
+WARN_GLOBAL_VOLUME_DIAG_RE = re.compile(r"\[warn\]\[global_volume_diag\]\s*(.+)", re.I)
 FATAL_CPU_RE = re.compile(r"\[fatal\]\[cpu\]\s*(.+)", re.I)
 FATAL_CPU_ACTION_RE = re.compile(r"\[fatal\]\[cpu_action\]\s*(.+)", re.I)
 CPU_CONFIRM_RE = re.compile(r"\[cpu\]\s+User confirmation received", re.I)
@@ -302,6 +312,8 @@ STAGE_DEFS = [
         "patterns": [
             _regex(r"STAGE:\s*Checking CUDA"),
             _regex(r"STAGE:\s*Host driver failure"),
+            _regex(r"STAGE:\s*Checking workspace volume"),
+            _regex(r"STAGE:\s*No volume disk mounted"),
         ],
     },
     {
@@ -692,6 +704,12 @@ def detect_fatal_state(lines):
     saw_cuda_failure = False
     saw_broken_driver_text = False
 
+    volume_message = None
+    volume_action = None
+    volume_ru = None
+    agent_action = None
+    volume_diag = None
+
     for line in lines:
         gpu_match = FATAL_GPU_RE.search(line)
         if gpu_match and gpu_match.group(1).strip():
@@ -705,10 +723,73 @@ def detect_fatal_state(lines):
         if action_match and action_match.group(1).strip():
             action_message = action_match.group(1).strip()
 
+        vol_match = FATAL_VOLUME_RE.search(line)
+        if vol_match and vol_match.group(1).strip():
+            volume_message = vol_match.group(1).strip()
+
+        vol_action_match = FATAL_VOLUME_ACTION_RE.search(line)
+        if vol_action_match and vol_action_match.group(1).strip():
+            volume_action = vol_action_match.group(1).strip()
+
+        vol_ru_match = FATAL_VOLUME_RU_RE.search(line)
+        if vol_ru_match and vol_ru_match.group(1).strip():
+            volume_ru = vol_ru_match.group(1).strip()
+
+        agent_match = FATAL_AGENT_ACTION_RE.search(line)
+        if agent_match and agent_match.group(1).strip():
+            agent_action = agent_match.group(1).strip()
+
+        vol_diag_match = FATAL_VOLUME_DIAG_RE.search(line)
+        if vol_diag_match and vol_diag_match.group(1).strip():
+            volume_diag = vol_diag_match.group(1).strip()
+
         if CUDA_FAIL_RE.search(line):
             saw_cuda_failure = True
         if BROKEN_DRIVER_RE.search(line):
             saw_broken_driver_text = True
+
+    if volume_message or volume_action:
+        if not volume_message:
+            volume_message = (
+                "No Volume Disk is mounted at /workspace. Due to recent RunPod changes, "
+                "pods can spawn without a Volume Disk attached automatically, so deployment has been stopped."
+            )
+        if not volume_action:
+            volume_action = (
+                "How to edit your Pod to add a Volume Disk:\n"
+                "1. Open RunPod Console (https://console.runpod.io/pods).\n"
+                "2. Click the three dots (...) next to this Pod and select 'Edit Pod'.\n"
+                "3. Set 'Volume Disk' to 200 GB (Mount Path: /workspace).\n"
+                "4. Click 'Save' to restart the Pod with the volume attached."
+            )
+        if not volume_ru:
+            volume_ru = (
+                "В /workspace не примонтирован диск тома (Volume Disk). Из-за новых функций RunPod "
+                "диск тома может не создаваться автоматически вместе с подом, поэтому развёртывание остановлено.\n\n"
+                "Как отредактировать под и добавить Volume Disk:\n"
+                "1. Откройте RunPod Console (https://console.runpod.io/pods).\n"
+                "2. Нажмите на три точки (...) рядом с этим подом и выберите «Edit Pod».\n"
+                "3. Укажите размер «Volume Disk» — 200 GB (путь монтирования: /workspace).\n"
+                "4. Нажмите «Save», чтобы перезапустить под с диском."
+            )
+        if not agent_action:
+            agent_action = (
+                "AGENT DEPLOYMENT INSTRUCTION: No Volume Disk is mounted at /workspace and deployment is stopped. "
+                "Propose to the user to add 200 GB of Volume Disk space to this pod at /workspace "
+                "(edit/update the pod with Volume Disk = 200 GB mounted at /workspace, or redeploy with 200 GB volume disk)."
+            )
+        return {
+            "active": True,
+            "code": "no_volume_mounted",
+            "title": "No Volume Disk Mounted — Startup Halted",
+            "message": volume_message,
+            "action": volume_action,
+            "message_ru": volume_ru,
+            "agent_action": agent_action,
+            "recommended_volume_gb": 200,
+            "mount_path": "/workspace",
+            "detail": volume_diag,
+        }
 
     active = bool(fatal_message or action_message or saw_cuda_failure or saw_broken_driver_text)
     if not active:
@@ -725,7 +806,76 @@ def detect_fatal_state(lines):
         "title": "Startup Halted",
         "message": fatal_message,
         "action": action_message,
+        "message_ru": (
+            "Проверка CUDA/драйверов GPU не пройдена. На этом хосте GPU-драйверы выглядят "
+            "сломанными или устаревшими. Пересоздайте под на другом хосте."
+        ),
         "detail": diag_message,
+    }
+
+
+def detect_volume_warning_state(lines):
+    warn_message = None
+    warn_action = None
+    warn_ru = None
+    warn_agent = None
+    warn_diag = None
+
+    for line in lines:
+        m_msg = WARN_GLOBAL_VOLUME_RE.search(line)
+        if m_msg and m_msg.group(1).strip():
+            warn_message = m_msg.group(1).strip()
+
+        m_act = WARN_GLOBAL_VOLUME_ACTION_RE.search(line)
+        if m_act and m_act.group(1).strip():
+            warn_action = m_act.group(1).strip()
+
+        m_ru = WARN_GLOBAL_VOLUME_RU_RE.search(line)
+        if m_ru and m_ru.group(1).strip():
+            warn_ru = m_ru.group(1).strip()
+
+        m_agent = WARN_GLOBAL_VOLUME_AGENT_RE.search(line)
+        if m_agent and m_agent.group(1).strip():
+            warn_agent = m_agent.group(1).strip()
+
+        m_diag = WARN_GLOBAL_VOLUME_DIAG_RE.search(line)
+        if m_diag and m_diag.group(1).strip():
+            warn_diag = m_diag.group(1).strip()
+
+    if not (warn_message or warn_action or warn_ru):
+        return {"active": False}
+
+    if not warn_message:
+        warn_message = "A RunPod Global Volume is being used in place of a Pod Volume Disk."
+    if not warn_action:
+        warn_action = (
+            "If you do not manually delete the Global Volume after terminating this Pod, "
+            "RunPod will continue charging you $0.10/GB/month (10c/GB). Deployment is continuing normally."
+        )
+    if not warn_ru:
+        warn_ru = (
+            "Вместо обычного Volume Disk используется Global Volume. Развёртывание продолжается в штатном режиме, "
+            "но помните: Global Volume НЕ удаляется автоматически вместе с подом! Если вы не удалите Global Volume "
+            "вручную после завершения работы, RunPod будет продолжать списывать 10 центов за ГБ в месяц ($0.10/GB)."
+        )
+    if not warn_agent:
+        warn_agent = (
+            "AGENT DEPLOYMENT WARNING: A RunPod Global Volume is utilized in place of a Pod Volume Disk. "
+            "Do NOT stop deployment, but warn the user during deploy that Global Volumes are not deleted "
+            "when the pod is terminated and RunPod will charge $0.10/GB/month (10c/GB) if they do not delete "
+            "the Global Volume afterward."
+        )
+
+    return {
+        "active": True,
+        "code": "global_volume_in_use",
+        "title": "Warning: Global Volume in Use ($0.10/GB/month)",
+        "message": warn_message,
+        "action": warn_action,
+        "message_ru": warn_ru,
+        "agent_note": warn_agent,
+        "rate_per_gb_month_usd": 0.10,
+        "detail": warn_diag,
     }
 
 
@@ -860,12 +1010,14 @@ def build_state_payload(log_path, continue_file: str = "", cpu_pin_cores: str = 
     lines = tail_lines(log_path)
     backup_state = build_backup_state(lines)
     fatal_state = detect_fatal_state(lines)
+    volume_warning_state = detect_volume_warning_state(lines)
     cpu_confirm_state = detect_cpu_confirm_state(lines, continue_file, cpu_pin_cores)
     return {
         "timestamp": time.time(),
         "stages": compute_stage_states(lines, backup_state, fatal_state),
         "backup": backup_state,
         "fatal": fatal_state,
+        "volume_warning": volume_warning_state,
         "cpu_confirm": cpu_confirm_state,
         "env": {
             "backup_repo": ENV_INFO["backup_repo"],
@@ -1200,6 +1352,53 @@ HTML_PAGE = """<!doctype html>
       color: #f6e7a3;
       font-size: 14px;
       line-height: 1.45;
+      white-space: pre-line;
+    }
+    .fatal-agent-note {
+      display: none;
+      margin-top: 14px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid rgba(240, 255, 65, 0.45);
+      background: rgba(6, 7, 10, 0.55);
+      color: #f0ff41;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12.5px;
+      line-height: 1.4;
+      white-space: pre-line;
+    }
+    .volume-warning-banner {
+      display: none;
+      width: min(560px, 94vw);
+      margin-top: 22px;
+      border: 1px solid rgba(240, 255, 65, 0.72);
+      border-radius: 16px;
+      background: linear-gradient(180deg, rgba(82, 67, 23, 0.52), rgba(49, 39, 15, 0.62));
+      padding: 16px 18px;
+      color: #f6e7a3;
+      font-size: 13.5px;
+      line-height: 1.42;
+      text-align: left;
+      box-shadow: 0 10px 26px rgba(0, 0, 0, 0.34);
+    }
+    .volume-warning-title {
+      font-size: 15px;
+      line-height: 1.3;
+      font-weight: 700;
+      margin-bottom: 8px;
+      color: #f0ff41;
+    }
+    .volume-warning-columns {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 12px;
+    }
+    .volume-warning-detail {
+      margin: 0;
+      color: #f6e7a3;
+      font-size: 13px;
+      line-height: 1.42;
+      white-space: pre-line;
     }
     .cpu-message { display: none; }
     .cpu-support-link {
@@ -1280,7 +1479,7 @@ HTML_PAGE = """<!doctype html>
       .center-column { order: 2; min-height: 360px; }
       .node-catalog { text-align: left; }
       .node-list { max-height: 260px; }
-      .fatal-columns, .cpu-columns { grid-template-columns: 1fr; }
+      .fatal-columns, .cpu-columns, .volume-warning-columns { grid-template-columns: 1fr; }
       .fatal-panel, .cpu-panel { min-height: 0; }
     }
   </style>
@@ -1309,6 +1508,13 @@ HTML_PAGE = """<!doctype html>
           <div class="progress-track" aria-hidden="true"><div class="progress-runner"></div></div>
           <div class="current-stage" data-current-stage>Checking pod health</div>
           <div class="hint-note" data-start-note>If it takes more than 5 minutes, redeploy the pod</div>
+          <div class="volume-warning-banner" data-volume-warning-panel>
+            <div class="volume-warning-title" data-volume-warning-title>Warning: Global Volume in Use ($0.10/GB/month)</div>
+            <div class="volume-warning-columns">
+              <div class="volume-warning-detail" data-volume-warning-en></div>
+              <div class="volume-warning-detail" data-volume-warning-ru></div>
+            </div>
+          </div>
         </div>
         <div class="fatal-panel" data-fatal-panel>
           <div class="fatal-title" data-fatal-title></div>
@@ -1318,6 +1524,7 @@ HTML_PAGE = """<!doctype html>
               Проверка CUDA/драйверов GPU не пройдена. На этом хосте GPU-драйверы выглядят сломанными или устаревшими. Пересоздайте под на другом хосте.
             </div>
           </div>
+          <div class="fatal-agent-note" data-fatal-agent-note></div>
         </div>
         <div class="cpu-panel" data-cpu-panel>
           <div class="cpu-title" data-cpu-title></div>
@@ -1364,6 +1571,11 @@ HTML_PAGE = """<!doctype html>
     const fatalTitle = document.querySelector('[data-fatal-title]');
     const fatalDetailEn = document.querySelector('[data-fatal-detail-en]');
     const fatalDetailRu = document.querySelector('[data-fatal-detail-ru]');
+    const fatalAgentNote = document.querySelector('[data-fatal-agent-note]');
+    const volumeWarningPanel = document.querySelector('[data-volume-warning-panel]');
+    const volumeWarningTitle = document.querySelector('[data-volume-warning-title]');
+    const volumeWarningEn = document.querySelector('[data-volume-warning-en]');
+    const volumeWarningRu = document.querySelector('[data-volume-warning-ru]');
     const cpuPanel = document.querySelector('[data-cpu-panel]');
     const cpuTitle = document.querySelector('[data-cpu-title]');
     const cpuMessage = document.querySelector('[data-cpu-message]');
@@ -1588,21 +1800,55 @@ HTML_PAGE = """<!doctype html>
         if (fatalDetailEn) {
           fatalDetailEn.textContent = '';
         }
+        if (fatalAgentNote) {
+          fatalAgentNote.style.display = 'none';
+          fatalAgentNote.textContent = '';
+        }
         setBlockingMode();
         return;
       }
       fatalPanel.style.display = 'block';
       fatalTitle.textContent = fatal.title || 'Startup halted';
       const msg = fatal.message || 'Host GPU drivers look corrupt or outdated; CUDA initialization failed.';
-      const action = fatal.action ? ` ${fatal.action}` : '';
-      const detail = fatal.detail ? ` Diagnostics: ${fatal.detail}` : '';
+      const action = fatal.action ? `\n\n${fatal.action}` : '';
+      const detail = (fatal.detail && fatal.code !== 'no_volume_mounted') ? `\n\nDiagnostics: ${fatal.detail}` : '';
       if (fatalDetailEn) {
         fatalDetailEn.textContent = `${msg}${action}${detail}`;
       }
-      if (fatalDetailRu && !fatalDetailRu.textContent.trim()) {
-        fatalDetailRu.textContent = 'Проверка CUDA/драйверов GPU не пройдена. На этом хосте GPU-драйверы выглядят сломанными или устаревшими. Пересоздайте под на другом хосте.';
+      if (fatalDetailRu) {
+        fatalDetailRu.textContent = fatal.message_ru || 'Проверка CUDA/драйверов GPU не пройдена. На этом хосте GPU-драйверы выглядят сломанными или устаревшими. Пересоздайте под на другом хосте.';
+      }
+      if (fatalAgentNote) {
+        if (fatal.agent_action) {
+          fatalAgentNote.style.display = 'block';
+          fatalAgentNote.textContent = fatal.agent_action;
+        } else {
+          fatalAgentNote.style.display = 'none';
+          fatalAgentNote.textContent = '';
+        }
       }
       setBlockingMode();
+    }
+
+    function renderVolumeWarning(volumeWarning) {
+      if (!volumeWarningPanel) return;
+      const active = !!(volumeWarning && volumeWarning.active);
+      if (!active) {
+        volumeWarningPanel.style.display = 'none';
+        return;
+      }
+      volumeWarningPanel.style.display = 'block';
+      if (volumeWarningTitle) {
+        volumeWarningTitle.textContent = volumeWarning.title || 'Warning: Global Volume in Use ($0.10/GB/month)';
+      }
+      const msg = volumeWarning.message || 'A RunPod Global Volume is being used in place of a Pod Volume Disk.';
+      const action = volumeWarning.action ? ` ${volumeWarning.action}` : '';
+      if (volumeWarningEn) {
+        volumeWarningEn.textContent = `${msg}${action}`;
+      }
+      if (volumeWarningRu) {
+        volumeWarningRu.textContent = volumeWarning.message_ru || 'Вместо обычного Volume Disk используется Global Volume. Если вы не удалите Global Volume вручную после завершения работы, RunPod будет продолжать списывать 10 центов за ГБ в месяц ($0.10/GB). Развёртывание продолжается.';
+      }
     }
 
     function renderCpuConfirm(cpuConfirm) {
@@ -1728,6 +1974,7 @@ HTML_PAGE = """<!doctype html>
         if (res.ok) {
           const data = await res.json();
           renderFatal(data.fatal);
+          renderVolumeWarning(data.volume_warning);
           renderCpuConfirm(data.cpu_confirm);
           renderStages(data.stages);
           renderCatalog(data.backup);
