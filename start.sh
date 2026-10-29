@@ -654,6 +654,8 @@ FIZGIG_VENV="${FIZGIG_VENV:-$FIZGIG_DIR/venv}"
 FIZGIG_UI_PORT="${FIZGIG_UI_PORT:-8081}"
 FIZGIG_UPDATE="${FIZGIG_UPDATE:-1}"
 FIZGIG_APP_PID=""
+export FIZGIG_HOME="$FIZGIG_DIR"
+export INSIGHTFACE_HOME="/workspace/.cache/insightface"
 
 run_model_sync() {
   local sync_script="/scripts/sync_comfy_fizgig_models.py"
@@ -716,6 +718,7 @@ prepare_fizgig_runtime() {
   set +e
   if [[ -f "/tmp/fizgig_prep.done" ]]; then
     if is_fizgig_venv_healthy; then
+      run_model_sync
       echo "[fizgig] runtime already prepared in this session; skipping redundant prep" >> /fizgig_setup.log
       return 0
     else
@@ -740,6 +743,7 @@ prepare_fizgig_runtime() {
 
   if [[ -f "/tmp/fizgig_prep.done" ]]; then
     if is_fizgig_venv_healthy; then
+      run_model_sync
       return 0
     else
       rm -f "/tmp/fizgig_prep.done" "$FIZGIG_DIR/.prepared" "$FIZGIG_VENV/.isolated_torch_linked" 2>/dev/null || true
@@ -748,7 +752,7 @@ prepare_fizgig_runtime() {
 
   echo "$$" > "$lock_file"
   echo "[fizgig] setting up in $FIZGIG_DIR" >> /fizgig_setup.log
-  mkdir -p "$FIZGIG_DIR" /workspace/datasets /workspace/models /workspace/output_loras /workspace/cache /workspace/profiles
+  mkdir -p "$FIZGIG_DIR" "$FIZGIG_DIR/user_data/models" "$FIZGIG_DIR/user_data/profiles" "$FIZGIG_DIR/user_data/cache" "$FIZGIG_DIR/datasets"
 
   # 1. Clone or update repository from git
   local old_commit="none"
@@ -983,130 +987,8 @@ PY
     echo "[fizgig] isolated venv and requirements already up to date (${new_commit:0:7})" >> /fizgig_setup.log
   fi
 
-  # 4. Patch Fizgig to disable password authentication and link ComfyUI models
-  FIZGIG_DIR="$FIZGIG_DIR" python3 - <<'PY' >> /fizgig_setup.log 2>&1
-import os, re, shutil
-from pathlib import Path
-
-fizgig_dir = Path(os.environ.get("FIZGIG_DIR", "/workspace/Fizgig"))
-
-# Install comfy_sync helper into fizgig package
-comfy_sync_src = Path("/scripts/sync_comfy_fizgig_models.py")
-comfy_sync_dest = fizgig_dir / "src" / "fizgig" / "comfy_sync.py"
-if comfy_sync_src.is_file():
-    comfy_sync_dest.parent.mkdir(parents=True, exist_ok=True)
-    comfy_sync_dest.write_text(comfy_sync_src.read_text(encoding="utf-8"), encoding="utf-8")
-    print("[fizgig] installed comfy_sync helper into fizgig package")
-
-server_file = fizgig_dir / "src" / "fizgig" / "web" / "server.py"
-if server_file.is_file():
-    text = server_file.read_text(encoding="utf-8")
-    # Patch _logged_in to always return True
-    text = re.sub(
-        r'def _logged_in\(self\):.*?(?=\n    def )',
-        'def _logged_in(self):\n        return True\n',
-        text,
-        flags=re.DOTALL
-    )
-    # Patch _host_ok to always return True
-    text = re.sub(
-        r'def _host_ok\(self\):.*?(?=\n    def )',
-        'def _host_ok(self):\n        return True\n',
-        text,
-        flags=re.DOTALL
-    )
-    # Patch run_server to ensure password is None and local_only is False
-    text = text.replace('Handler.password = password or None', 'Handler.password = None')
-    text = text.replace('Handler.local_only = not password', 'Handler.local_only = False')
-    if 'a.password = None' not in text:
-        text = text.replace('a = ap.parse_args(argv)', 'a = ap.parse_args(argv)\n    a.password = None')
-
-    # Hook _fetch_on_use in server.py to save models directly to ComfyUI models directory
-    if "from fizgig.comfy_sync import get_comfy_target" not in text:
-        target_srv = "os.replace(got, dest)             # a file in a repo subfolder: to the models folder itself\n            update_prefs({f.pref_key: dest})"
-        replacement_srv = """os.replace(got, dest)             # a file in a repo subfolder: to the models folder itself
-            try:
-                from fizgig.comfy_sync import get_comfy_target
-                comfy_dest = get_comfy_target(f.pref_key, getattr(f, "path", ""), os.path.basename(dest))
-                if comfy_dest and os.path.abspath(dest) != os.path.abspath(comfy_dest):
-                    import shutil
-                    os.makedirs(os.path.dirname(comfy_dest), exist_ok=True)
-                    if os.path.exists(comfy_dest):
-                        try: os.remove(comfy_dest)
-                        except OSError: pass
-                    shutil.move(dest, comfy_dest)
-                    if not os.path.exists(dest) and not os.path.islink(dest):
-                        try: os.symlink(comfy_dest, dest)
-                        except OSError: pass
-                    dest = comfy_dest
-            except Exception:
-                pass
-            update_prefs({f.pref_key: dest})"""
-        if target_srv in text:
-            text = text.replace(target_srv, replacement_srv, 1)
-            print("[fizgig] hooked _fetch_on_use in server.py to link ComfyUI models")
-
-    server_file.write_text(text, encoding="utf-8")
-    print("[fizgig] password authentication, host check, and model link patched in server.py")
-
-fetch_models_file = fizgig_dir / "src" / "fizgig" / "scripts" / "fetch_models.py"
-if fetch_models_file.is_file():
-    fm_text = fetch_models_file.read_text(encoding="utf-8")
-    if "from fizgig.comfy_sync import get_comfy_target" not in fm_text:
-        target_check = "if os.path.isfile(dest) and _valid_safetensors(dest, min_bytes):"
-        replacement_check = """    try:
-        from fizgig.comfy_sync import get_comfy_target
-        comfy_dest = get_comfy_target(w.pref_key, getattr(w, "path_in_repo", ""), w.filename)
-        if comfy_dest and os.path.isfile(comfy_dest) and _valid_safetensors(comfy_dest, min_bytes):
-            if not os.path.exists(dest) and not os.path.islink(dest):
-                try: os.symlink(comfy_dest, dest)
-                except OSError: pass
-            log(f"  [have] {w.filename} — found in ComfyUI models, linking into Preferences")
-            prefs[w.pref_key] = comfy_dest
-            return True
-    except Exception:
-        comfy_dest = None
-
-    if os.path.isfile(dest) and _valid_safetensors(dest, min_bytes):"""
-        if target_check in fm_text:
-            fm_text = fm_text.replace(target_check, replacement_check, 1)
-
-        target_save = 'prefs[w.pref_key] = dest\n    log(f"  [done] {w.filename}")'
-        replacement_save = """    try:
-        from fizgig.comfy_sync import get_comfy_target
-        comfy_dest = get_comfy_target(w.pref_key, getattr(w, "path_in_repo", ""), w.filename)
-        if comfy_dest and os.path.abspath(dest) != os.path.abspath(comfy_dest):
-            import shutil
-            os.makedirs(os.path.dirname(comfy_dest), exist_ok=True)
-            if os.path.exists(comfy_dest):
-                try: os.remove(comfy_dest)
-                except OSError: pass
-            shutil.move(dest, comfy_dest)
-            if not os.path.exists(dest) and not os.path.islink(dest):
-                try: os.symlink(comfy_dest, dest)
-                except OSError: pass
-            dest = comfy_dest
-            log(f"  [comfy] moved {w.filename} -> {comfy_dest}")
-    except Exception as e:
-        log(f"  [warn] failed linking {w.filename} to ComfyUI: {e}")
-
-    prefs[w.pref_key] = dest
-    log(f"  [done] {w.filename}")"""
-        if target_save in fm_text:
-            fm_text = fm_text.replace(target_save, replacement_save, 1)
-
-        fetch_models_file.write_text(fm_text, encoding="utf-8")
-        print("[fizgig] hooked fetch_weight in fetch_models.py to link ComfyUI models")
-PY
-
-  # 5. Shared model directories & preferences configuration
-  echo "[fizgig] configuring shared models with ComfyUI..." >> /fizgig_setup.log
-  mkdir -p "$FIZGIG_DIR/user_data" /workspace/models
-  # Symlink user_data/models to /workspace/models if needed
-  if [[ ! -L "$FIZGIG_DIR/user_data/models" && ! -d "$FIZGIG_DIR/user_data/models" ]]; then
-    ln -s /workspace/models "$FIZGIG_DIR/user_data/models" 2>/dev/null || true
-  fi
-
+  # 4. Patch Fizgig sources, migrate any loose workspace directories, and sync ComfyUI models
+  echo "[fizgig] configuring shared ComfyUI models and patching download hooks..." >> /fizgig_setup.log
   run_model_sync
 
   if is_fizgig_venv_healthy; then

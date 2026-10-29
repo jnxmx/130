@@ -192,8 +192,8 @@ ENV HF_HOME="/workspace/.cache/huggingface" \
     UV_CACHE_DIR="/workspace/.cache/uv/" \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     TRANSFORMERS_CACHE="/workspace/.cache/huggingface/transformers" \
-    INSIGHTFACE_HOME="/workspace/.insightface" \
-    FIZGIG_HOME="/workspace" \
+    INSIGHTFACE_HOME="/workspace/.cache/insightface" \
+    FIZGIG_HOME="/workspace/Fizgig" \
     FIZGIG_POD=1 \
     NIGHTLY_COMFYUI=0
 
