@@ -1714,6 +1714,14 @@ run_model_sync
 migrate_manager_settings
 cleanup_legacy_manager
 
+# Remove deprecated Comfyui_Minimax_h3_latent_Upscaler custom node (now native in ComfyUI)
+for _obs_node in "/workspace/ComfyUI/custom_nodes/Comfyui_Minimax_h3_latent_Upscaler" "/Comfy/custom_nodes/Comfyui_Minimax_h3_latent_Upscaler"; do
+  if [[ -d "$_obs_node" ]]; then
+    rm -rf "$_obs_node"
+    echo "[nodes] removed deprecated custom node $(basename "$_obs_node") (native in ComfyUI)"
+  fi
+done
+
 # --- Venv create/activate ---
 if [[ ! -d "$VIRTUAL_ENV" ]]; then
   echo "Creating venv at $VIRTUAL_ENV…"
