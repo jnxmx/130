@@ -1010,17 +1010,25 @@ prepare_fizgig_runtime() {
       git -C "$FIZGIG_DIR" remote set-url origin "$FIZGIG_REPO_URL" >> /fizgig_setup.log 2>&1 || true
       if ! git -C "$FIZGIG_DIR" fetch --depth 1 origin "$FIZGIG_REPO_REF" >> /fizgig_setup.log 2>&1 \
          || ! git -C "$FIZGIG_DIR" reset --hard FETCH_HEAD >> /fizgig_setup.log 2>&1; then
-        echo "[fizgig][warn] git update failed (possible volume corruption); attempting clean re-clone" >> /fizgig_setup.log
-        rm -rf "$FIZGIG_DIR.broken" 2>/dev/null || true
-        mv "$FIZGIG_DIR" "$FIZGIG_DIR.broken" 2>/dev/null || true
-        git clone --depth 1 --branch "$FIZGIG_REPO_REF" "$FIZGIG_REPO_URL" "$FIZGIG_DIR" >> /fizgig_setup.log 2>&1 || true
+        echo "[fizgig][warn] git update failed (possible volume corruption); attempting in-place reset" >> /fizgig_setup.log
+        git -C "$FIZGIG_DIR" fetch --depth 1 origin "$FIZGIG_REPO_REF" >> /fizgig_setup.log 2>&1 || true
+        git -C "$FIZGIG_DIR" checkout -f -B "$FIZGIG_REPO_REF" FETCH_HEAD >> /fizgig_setup.log 2>&1 || true
       fi
     else
       echo "[fizgig] update disabled; keeping current checkout" >> /fizgig_setup.log
     fi
   else
-    echo "[fizgig] cloning repo ($FIZGIG_REPO_REF) from $FIZGIG_REPO_URL" >> /fizgig_setup.log
-    git clone --depth 1 --branch "$FIZGIG_REPO_REF" "$FIZGIG_REPO_URL" "$FIZGIG_DIR" >> /fizgig_setup.log 2>&1 || true
+    echo "[fizgig] setting up repo ($FIZGIG_REPO_REF) from $FIZGIG_REPO_URL" >> /fizgig_setup.log
+    # If directory already exists (e.g. user_data/ created by model_sync), initialize git in-place
+    # instead of bare git clone which fails on non-empty directories.
+    if [[ -d "$FIZGIG_DIR" ]]; then
+      git -C "$FIZGIG_DIR" init >> /fizgig_setup.log 2>&1 || true
+      git -C "$FIZGIG_DIR" remote add origin "$FIZGIG_REPO_URL" >> /fizgig_setup.log 2>&1 || git -C "$FIZGIG_DIR" remote set-url origin "$FIZGIG_REPO_URL" >> /fizgig_setup.log 2>&1 || true
+      git -C "$FIZGIG_DIR" fetch --depth 1 origin "$FIZGIG_REPO_REF" >> /fizgig_setup.log 2>&1 || true
+      git -C "$FIZGIG_DIR" checkout -f -B "$FIZGIG_REPO_REF" FETCH_HEAD >> /fizgig_setup.log 2>&1 || true
+    else
+      git clone --depth 1 --branch "$FIZGIG_REPO_REF" "$FIZGIG_REPO_URL" "$FIZGIG_DIR" >> /fizgig_setup.log 2>&1 || true
+    fi
   fi
 
   if [[ ! -f "$FIZGIG_DIR/fizgig.py" ]]; then
