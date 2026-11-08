@@ -1088,12 +1088,14 @@ if not sys_site:
         sys_site = "/usr/local/lib/python3.12/dist-packages"
 
 patterns = [
-    "torch*", "functorch*", "torchvision*", "torchaudio*",
-    "nvidia*", "triton*", "cuda*", "cublas*", "cudnn*", "caffe2*"
+    "torch", "torch-*.dist-info", "torchgen*", "functorch*",
+    "torchvision*", "torchaudio*", "torchcodec*",
+    "nvidia*", "triton*", "cuda*", "cublas*", "cudnn*", "caffe2*",
+    "filelock*", "fsspec*", "jinja2*", "networkx*", "sympy*", "typing_extensions*", "mpmath*"
 ]
 
 # Clean up legacy non-torch symlinks and dist-infos so uv has full control over them
-for legacy_pat in ["hf_transfer*", "hf-transfer*", "huggingface_hub*"]:
+for legacy_pat in ["hf_transfer*", "hf-transfer*", "huggingface_hub*", "torchsde*"]:
     for dst in target_site.glob(legacy_pat):
         if dst.is_symlink() or dst.is_file():
             dst.unlink(missing_ok=True)
@@ -1194,20 +1196,24 @@ PY
     if [[ -f "$FIZGIG_DIR/requirements.txt" ]]; then
       echo "[fizgig] installing requirements into isolated venv..." >> /fizgig_setup.log
       local tmp_req="$FIZGIG_DIR/requirements.no-torch.txt"
-      # Strip --extra-index-url (which hardcodes cu128 in Fizgig repo) so we retain CUDA 13.0
-      grep -Ev '^\s*--extra-index-url' "$FIZGIG_DIR/requirements.txt" > "$tmp_req" 2>/dev/null || cp "$FIZGIG_DIR/requirements.txt" "$tmp_req"
+      # Strip --extra-index-url and system-provided PyTorch/CUDA packages so we retain base image CUDA 13 PyTorch
+      grep -E -v '^\s*(torchvision|torchaudio|torchcodec|torchsde|torch|triton(-windows)?)\b|^\s*--(extra-)?index-url' "$FIZGIG_DIR/requirements.txt" > "$tmp_req" 2>/dev/null || cp "$FIZGIG_DIR/requirements.txt" "$tmp_req"
       # Ensure hf_transfer is installed for fast downloads and HF_HUB_ENABLE_HF_TRANSFER compatibility
       grep -q -E "^hf[-_]transfer" "$tmp_req" 2>/dev/null || echo "hf_transfer" >> "$tmp_req"
 
       local constraint_args=()
-      if [[ -n "${PIP_CONSTRAINT:-}" && -f "${PIP_CONSTRAINT}" ]]; then
-        constraint_args=(--constraint "$PIP_CONSTRAINT")
+      local fizgig_constraint="$FIZGIG_DIR/constraints.torch.txt"
+      if [[ -f "${DEFAULT_PYTHON_CONSTRAINTS:-/etc/pip/constraints.txt}" ]]; then
+        grep -E '^(torch|torchvision|torchaudio|torchcodec)\b' "${DEFAULT_PYTHON_CONSTRAINTS:-/etc/pip/constraints.txt}" > "$fizgig_constraint" 2>/dev/null || true
+        if [[ -s "$fizgig_constraint" ]]; then
+          constraint_args=(--constraint "$fizgig_constraint")
+        fi
       fi
 
       export UV_LINK_MODE="copy"
 
       local install_ok=0
-      if env DISABLE_CUDA=1 \
+      if env -u UV_EXTRA_INDEX_URL -u PIP_EXTRA_INDEX_URL UV_CONSTRAINT="${fizgig_constraint:-}" UV_BUILD_CONSTRAINT="${fizgig_constraint:-}" PIP_CONSTRAINT="${fizgig_constraint:-}" DISABLE_CUDA=1 \
           "$FIZGIG_VENV/bin/python" -m uv pip install \
             --link-mode=copy \
             --index-strategy unsafe-best-match \
@@ -1217,7 +1223,7 @@ PY
         install_ok=1
       else
         echo "[fizgig][warn] uv pip install failed, attempting pip fallback..." >> /fizgig_setup.log
-        if env DISABLE_CUDA=1 \
+        if env -u UV_EXTRA_INDEX_URL -u PIP_EXTRA_INDEX_URL PIP_CONSTRAINT="${fizgig_constraint:-}" DISABLE_CUDA=1 \
           "$FIZGIG_VENV/bin/python" -m pip install \
             --no-build-isolation \
             "${constraint_args[@]}" \
