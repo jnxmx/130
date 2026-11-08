@@ -106,6 +106,38 @@ pip_install_requirements() {
   fi
 }
 
+install_comfyui_core_requirements() {
+  local py="$1"
+  local req="$2"
+  shift 2
+
+  local use_uv_core="${RUNTIME_USE_UV:-1}"
+  if [[ "$use_uv_core" == "1" ]] && command -v uv >/dev/null 2>&1; then
+    local constraint_args=()
+    if [[ -n "${PIP_CONSTRAINT:-}" ]]; then
+      constraint_args=(--constraint "$PIP_CONSTRAINT")
+    fi
+
+    # Dry-run guard: ensure uv does not attempt to resolve or install torch/CUDA ecosystem packages
+    local dry_run_out=""
+    dry_run_out="$(UV_LINK_MODE=copy UV_CONCURRENT_DOWNLOADS=16 uv pip install --python "$py" "${constraint_args[@]}" --dry-run -r "$req" 2>&1 || true)"
+    if echo "$dry_run_out" | grep -qE '\b(torch|torchvision|torchaudio|nvidia-|triton|onnxruntime|xformers|bitsandbytes)\b'; then
+      echo "[deps][warn] uv dry-run detected torch/CUDA ecosystem package in plan; falling back to pip to preserve system torch"
+    else
+      echo "[deps] installing ComfyUI core requirements via uv (parallel downloads)..."
+      if env UV_LINK_MODE=copy UV_CONCURRENT_DOWNLOADS=16 UV_EXTRA_INDEX_URL="" PIP_EXTRA_INDEX_URL="" \
+          uv pip install --python "$py" "${constraint_args[@]}" -r "$req" "$@"; then
+        echo "[deps] ComfyUI core requirements installed via uv."
+        return 0
+      fi
+      echo "[deps][warn] uv install failed; falling back to pip..."
+    fi
+  fi
+
+  # Fallback: standard pip install without slow PyTorch index for core requirements
+  env PIP_EXTRA_INDEX_URL="" "$py" -m pip install -r "$req" "$@"
+}
+
 run_with_manager_pip_env() {
   PIP_NO_COMPILE=1 "$@"
 }
@@ -1319,7 +1351,7 @@ update_comfyui_core() {
         echo "[deps] requirements.txt unchanged in ComfyUI core; skipping reinstall"
       else
         echo "[deps] requirements.txt updated in ComfyUI core; installing packages"
-        pip_install_requirements "$VIRTUAL_ENV/bin/python" requirements.txt || true
+        install_comfyui_core_requirements "$VIRTUAL_ENV/bin/python" requirements.txt || true
       fi
     else
       echo "[deps] ComfyUI core is already at commit ${new:0:7}; requirements check skipped"
