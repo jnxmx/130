@@ -2123,7 +2123,22 @@ def apply_staged_snapshot():
     print(f"[restore] snapshot restore exit code {rc}")
 
 
-if mode == "base":
+if mode == "nodes":
+    if SNAP in files:
+        selections = [{"kind": "custom_nodes_all"}]
+        print("[restore] staging custom nodes from backup...")
+        print(backup.restore_selected_from_huggingface(repo, selections, target_dir=comfy))
+    apply_staged_snapshot()
+elif mode == "files":
+    tops = sorted({"ComfyUI/" + f[len("ComfyUI/"):].split("/", 1)[0]
+                   for f in files if not f.startswith(MODELS) and f != SNAP and not f.startswith("ComfyUI/custom_nodes/")})
+    selections = [{"kind": "paths", "paths": tops}] if tops else []
+    if selections:
+        print(f"[restore] restoring non-model files ({len(tops)} directories: {', '.join(tops)})...")
+        print(backup.restore_selected_from_huggingface(repo, selections, target_dir=comfy))
+    else:
+        print("[restore] no non-model files to restore")
+elif mode == "base":
     tops = sorted({"ComfyUI/" + f[len("ComfyUI/"):].split("/", 1)[0]
                    for f in files if not f.startswith(MODELS) and f != SNAP})
     selections = [{"kind": "paths", "paths": tops}] if tops else []
@@ -2165,9 +2180,9 @@ PY
 echo "RESTORE_BACKUP: ${RESTORE_BACKUP:-}"
 echo "COMFYUI_BACKUP: ${COMFYUI_BACKUP:-}"
 RESTORE_JUST_RAN=0
-if [[ "${RESTORE_BACKUP:-0}" == "1" && -n "${COMFYUI_BACKUP:-}" && -d "/workspace/ComfyUI" && ! -f "/workspace/.restore_done" ]]; then
+if [[ "${RESTORE_BACKUP:-0}" == "1" && -n "${COMFYUI_BACKUP:-}" && -d "/workspace/ComfyUI" && ! -f "/workspace/.restore_nodes_done" && ! -f "/workspace/.restore_done" ]]; then
   echo "[restore] first-boot restore enabled"
-  echo "[INFO] First-boot restore from ${COMFYUI_BACKUP}…"
+  echo "[INFO] First-boot custom nodes restore from ${COMFYUI_BACKUP}…"
   if ! "$VIRTUAL_ENV/bin/python" -c "import huggingface_hub, yaml, hf_transfer" 2>/dev/null; then
     pip_install "$VIRTUAL_ENV/bin/python" -q huggingface_hub PyYAML hf_transfer || true
   fi
@@ -2175,27 +2190,51 @@ if [[ "${RESTORE_BACKUP:-0}" == "1" && -n "${COMFYUI_BACKUP:-}" && -d "/workspac
   if HFD_NODE_DIR="$(find_hf_downloader_nodepack)"; then
     export HFD_NODE_DIR
     echo "[restore] using nodepack restore API from $HFD_NODE_DIR"
-    echo "[restore] restoring user/input/settings + custom nodes (foreground)..."
-    if hfd_restore base; then
+    echo "[restore] restoring custom nodes from backup (foreground)..."
+    if hfd_restore nodes; then
       RESTORE_JUST_RAN=1
-      touch /workspace/.restore_done
-      echo "[restore] base restore complete"
+      touch /workspace/.restore_nodes_done
+      echo "[restore] custom nodes restore complete"
     else
-      echo "[restore][error] base restore failed; will retry on next boot (no .restore_done written)"
+      echo "[restore][error] custom nodes restore failed; will retry on next boot"
     fi
   else
     echo "[restore][warn] ComfyUI_HuggingFace_Downloader nodepack (backup.py) not found; skipping restore"
   fi
 else
-  echo "Backup restore skipped."
+  echo "Backup custom nodes restore skipped."
 fi
 
-# Models are restored in the background (resumable: re-runs on next boot until complete)
-if [[ "${RESTORE_BACKUP:-0}" == "1" && -n "${COMFYUI_BACKUP:-}" && -f "/workspace/.restore_done" && ! -f "/workspace/.restore_models_done" ]]; then
+# Files (input, output, user data) and models are restored in the background (parallel to startup, resumable)
+if [[ "${RESTORE_BACKUP:-0}" == "1" && -n "${COMFYUI_BACKUP:-}" && -d "/workspace/ComfyUI" && ! -f "/workspace/.restore_done" ]]; then
   if HFD_NODE_DIR="$(find_hf_downloader_nodepack)"; then
     export HFD_NODE_DIR
-    echo "[restore] restoring models in background (log: /restore.log)"
-    ( if hfd_restore models; then touch /workspace/.restore_models_done; run_model_sync; fi ) >> /restore.log 2>&1 &
+    echo "[restore] restoring backup files and models in background (log: /restore.log)"
+    (
+      if [[ ! -f "/workspace/.restore_files_done" ]]; then
+        echo "[restore] starting background files restore (input, output, user data)..."
+        if hfd_restore files; then
+          touch /workspace/.restore_files_done
+          echo "[restore] background files restore complete"
+        else
+          echo "[restore][warn] background files restore had failures"
+        fi
+      fi
+      if [[ ! -f "/workspace/.restore_models_done" ]]; then
+        echo "[restore] starting background models restore..."
+        if hfd_restore models; then
+          touch /workspace/.restore_models_done
+          echo "[restore] background models restore complete"
+          run_model_sync
+        else
+          echo "[restore][warn] background models restore had failures"
+        fi
+      fi
+      if [[ -f "/workspace/.restore_files_done" && -f "/workspace/.restore_models_done" ]]; then
+        touch /workspace/.restore_done
+        echo "[restore] all backup data and models restored successfully"
+      fi
+    ) >> /restore.log 2>&1 &
   fi
 fi
 
