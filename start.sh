@@ -2249,16 +2249,18 @@ if [[ "${STUDENT_MODE:-0}" != "1" ]]; then
   fi
 
   if [[ -n "$target_user_dir" ]]; then
-    rm -rf /tmp/comfy_course_tmp
-    # Avoid exiting the whole script if network is flaky; check directory before moving
+    rm -rf /tmp/comfy_course_tmp || true
+    # Avoid exiting the whole script if network is flaky; sync into target safely without cross-device mv
     if git clone --depth=1 https://github.com/jnxmx/comfycourse_json.git /tmp/comfy_course_tmp 2>/dev/null; then
-      mkdir -p "$target_user_dir/workflows"
-      if [[ -d "$target_user_dir/workflows/comfy_course" ]]; then
-        echo "[course] comfy_course present; replacing with latest"
-        rm -rf "$target_user_dir/workflows/comfy_course"
+      rm -rf /tmp/comfy_course_tmp/.git || true
+      mkdir -p "$target_user_dir/workflows/comfy_course"
+      if command -v rsync >/dev/null 2>&1; then
+        rsync -a --delete /tmp/comfy_course_tmp/ "$target_user_dir/workflows/comfy_course/" 2>/dev/null || \
+          cp -a /tmp/comfy_course_tmp/. "$target_user_dir/workflows/comfy_course/" 2>/dev/null || true
+      else
+        cp -a /tmp/comfy_course_tmp/. "$target_user_dir/workflows/comfy_course/" 2>/dev/null || true
       fi
-      mv /tmp/comfy_course_tmp "$target_user_dir/workflows/comfy_course"
-      rm -rf "$target_user_dir/workflows/comfy_course/.git"
+      rm -rf /tmp/comfy_course_tmp || true
       echo "[course] comfy_course restored to $target_user_dir/workflows/comfy_course"
     else
       echo "[course][warn] failed to clone comfycourse_json; skipping restore"
