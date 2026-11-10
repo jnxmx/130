@@ -2748,21 +2748,7 @@ else
           rm -rf "${TMP_CLONE_DIR:-}"
       fi
   else
-      echo "STAGE: Installing sageattention"
-      echo "Installing sageattention from source tarball"
-      if ! dpkg -s libcusparse-dev >/dev/null 2>&1; then
-        echo "Installing libcusparse-dev dependency for CUDA extension compilation..."
-        apt-get update -qq && apt-get install -y --no-install-recommends libcusparse-dev -qq || true
-      fi
-      TMP_CLONE_DIR=$(mktemp -d /tmp/sage-dl.XXXXXX)
-      if _sage_fetch_source "$TMP_CLONE_DIR"; then
-        _sage_patch_and_build_env "$TMP_CLONE_DIR" "none" || true
-        pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_CLONE_DIR" || echo "[sage][warn] Failed to build/install sageattention from source; skipping (optional in modern ComfyUI)."
-        unset MAX_JOBS NINJA_MAX_JOBS EXT_PARALLEL NVCC_APPEND_FLAGS TORCH_CUDA_ARCH_LIST CUDA_HOME 2>/dev/null || true
-      else
-        echo "[sage][warn] Failed to download SageAttention source; skipping (optional in modern ComfyUI)."
-      fi
-      rm -rf "${TMP_CLONE_DIR:-}"
+      echo "[sage] Unsupported or unknown GPU architecture ($ARCH); skipping sageattention install (optional in modern ComfyUI)."
   fi
 fi
 
