@@ -1746,13 +1746,6 @@ if [[ -d /workspace/ComfyUI/models ]]; then
       https://raw.githubusercontent.com/madebyollin/taehv/62f7591f59dfbb4c3c02b7a621d180a9eeaba26c/safetensors/taeh3.safetensors \
       -o /workspace/ComfyUI/models/vae_approx/taeh3.safetensors || true
   fi
-  if [[ ! -f /workspace/ComfyUI/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors ]]; then
-    mkdir -p /workspace/ComfyUI/models/latent_upscale_models
-    echo "Downloading Minimax H3 Latent Upscaler weights..."
-    curl -fL --retry 3 \
-      https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/resolve/main/minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors \
-      -o /workspace/ComfyUI/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors || true
-  fi
 fi
 
 run_model_sync
