@@ -118,18 +118,27 @@ install_comfyui_core_requirements() {
       constraint_args=(--constraint "$PIP_CONSTRAINT")
     fi
 
-    # Dry-run guard: ensure uv does not attempt to resolve or install torch/CUDA ecosystem packages
+    # Filter out system CUDA 13 PyTorch stack packages already preinstalled in the image
+    local filtered_req
+    filtered_req="$(mktemp /tmp/comfy_core_req.XXXXXX.txt)"
+    grep -v -E '^\s*(torch|torchvision|torchaudio|nvidia-|triton)\b' "$req" > "$filtered_req" || true
+
+    # Dry-run guard: ensure uv does not attempt to resolve or change torch/CUDA ecosystem packages
     local dry_run_out=""
-    dry_run_out="$(UV_LINK_MODE=copy UV_CONCURRENT_DOWNLOADS=16 uv pip install --python "$py" "${constraint_args[@]}" --dry-run -r "$req" 2>&1 || true)"
-    if echo "$dry_run_out" | grep -qE '\b(torch|torchvision|torchaudio|nvidia-|triton|onnxruntime|xformers|bitsandbytes)\b'; then
+    dry_run_out="$(UV_LINK_MODE=copy UV_CONCURRENT_DOWNLOADS=16 uv pip install --python "$py" "${constraint_args[@]}" --dry-run -r "$filtered_req" 2>&1 || true)"
+
+    if echo "$dry_run_out" | grep -qE '^\s*(\+|\~|\-)\s*(torch|torchvision|torchaudio|nvidia-|triton|onnxruntime|xformers|bitsandbytes)\b'; then
       echo "[deps][warn] uv dry-run detected torch/CUDA ecosystem package in plan; falling back to pip to preserve system torch"
+      rm -f "$filtered_req"
     else
       echo "[deps] installing ComfyUI core requirements via uv (parallel downloads)..."
       if env UV_LINK_MODE=copy UV_CONCURRENT_DOWNLOADS=16 UV_EXTRA_INDEX_URL="" PIP_EXTRA_INDEX_URL="" \
-          uv pip install --python "$py" "${constraint_args[@]}" -r "$req" "$@"; then
+          uv pip install --python "$py" "${constraint_args[@]}" -r "$filtered_req" "$@"; then
+        rm -f "$filtered_req"
         echo "[deps] ComfyUI core requirements installed via uv."
         return 0
       fi
+      rm -f "$filtered_req"
       echo "[deps][warn] uv install failed; falling back to pip..."
     fi
   fi
