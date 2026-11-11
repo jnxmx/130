@@ -1388,6 +1388,12 @@ update_custom_nodes_parallel() {
     local idx="${#repo_dirs[@]}"
     (
       local old_sha new_sha
+      if ! git -C "$d" symbolic-ref -q HEAD >/dev/null 2>&1; then
+        local def_b
+        def_b="$(git -C "$d" rev-parse --abbrev-ref origin/HEAD 2>/dev/null | sed 's@^origin/@@')"
+        [[ -z "$def_b" || "$def_b" == "HEAD" ]] && def_b="main"
+        git -C "$d" checkout "$def_b" 2>/dev/null || git -C "$d" checkout master 2>/dev/null || true
+      fi
       old_sha="$(git -C "$d" rev-parse HEAD 2>/dev/null || echo)"
       GIT_TERMINAL_PROMPT=0 git -C "$d" pull --ff-only --quiet 2>/dev/null || true
       new_sha="$(git -C "$d" rev-parse HEAD 2>/dev/null || echo)"
@@ -2071,49 +2077,79 @@ def apply_staged_snapshot():
         print("[restore] no staged custom nodes snapshot")
         return
     nodes_dir = os.path.join(comfy, "custom_nodes")
-    installed = {d.lower() for d in os.listdir(nodes_dir)} if os.path.isdir(nodes_dir) else set()
+    if not os.path.isdir(nodes_dir):
+        os.makedirs(nodes_dir, exist_ok=True)
 
-    def strip(name):
-        name = name.rstrip("/").split("/")[-1].lower()
-        return name[:-4] if name.endswith(".git") else name
+    def norm(name):
+        name = str(name).strip().rstrip("/").split("/")[-1].lower()
+        if name.endswith(".git"):
+            name = name[:-4]
+        return name.replace("-", "").replace("_", "")
+
+    installed_norm = {norm(d) for d in os.listdir(nodes_dir)}
 
     with open(staged, encoding="utf-8") as fh:
         snap = yaml.safe_load(fh) or {}
-    missing_git = {u: v for u, v in (snap.get("git_custom_nodes") or {}).items()
-                   if strip(u) not in installed and strip(u).replace("_", "-") not in installed}
-    missing_cnr = {i: v for i, v in (snap.get("cnr_custom_nodes") or {}).items()
-                   if i.lower() not in installed and i.lower().replace("-", "_") not in installed}
-    if not missing_git and not missing_cnr:
-        print("[restore] all custom nodes from backup already installed")
-        return
-    print(f"[restore] installing {len(missing_git) + len(missing_cnr)} missing custom node(s) via ComfyUI-Manager")
 
-    cur_path = os.path.join(cache if mode == "models" else "/tmp", "hfd_current_snapshot.yaml")
-    merged_path = "/tmp/hfd_merged_snapshot.yaml"
+    to_install_git = []
+    for u in (snap.get("git_custom_nodes") or {}).keys():
+        if not u:
+            continue
+        if norm(u) not in installed_norm:
+            to_install_git.append(u)
+            installed_norm.add(norm(u))
+
+    to_install_cnr = []
+    for i in (snap.get("cnr_custom_nodes") or {}).keys():
+        if not i:
+            continue
+        clean_id = str(i).split("@")[0].strip()
+        if norm(clean_id) not in installed_norm:
+            to_install_cnr.append(clean_id)
+            installed_norm.add(norm(clean_id))
+
+    total = len(to_install_git) + len(to_install_cnr)
+    if total == 0:
+        print("[restore] all custom nodes from backup already installed (keeping latest versions)")
+        return
+    print(f"[restore] installing {total} missing custom node(s) at latest versions (unpinned)...")
+
     env = dict(os.environ, PIP_NO_COMPILE="1")
     cm_cli = next((p for p in (os.path.join(nodes_dir, "ComfyUI-Manager", "cm-cli.py"),
                                os.path.join(nodes_dir, "comfyui-manager", "cm-cli.py")) if os.path.isfile(p)), None)
     use_comfy = shutil.which("comfy") is not None
 
-    def run(args):
-        cmd = (["comfy", "--here", "--skip-prompt", "node"] + args) if use_comfy else [sys.executable, cm_cli] + args
-        return subprocess.run(cmd, cwd=comfy, env=env, check=False).returncode
+    # 1. Install missing git custom nodes at latest default branch HEAD (no commit pinning)
+    for url in to_install_git:
+        print(f"[restore] installing git custom node (latest): {url}")
+        installed_ok = False
+        if cm_cli:
+            rc = subprocess.run([sys.executable, cm_cli, "install", url], cwd=comfy, env=env, check=False).returncode
+            if rc == 0:
+                installed_ok = True
+        if not installed_ok and use_comfy:
+            rc = subprocess.run(["comfy", "--here", "--skip-prompt", "node", "install", url], cwd=comfy, env=env, check=False).returncode
+            if rc == 0:
+                installed_ok = True
+        if not installed_ok:
+            repo_name = url.rstrip("/").split("/")[-1]
+            if repo_name.endswith(".git"):
+                repo_name = repo_name[:-4]
+            dest = os.path.join(nodes_dir, repo_name)
+            if not os.path.exists(dest):
+                rc = subprocess.run(["git", "clone", "--depth=1", url, dest], cwd=nodes_dir, check=False).returncode
+                if rc == 0 and os.path.isfile(os.path.join(dest, "requirements.txt")):
+                    subprocess.run([sys.executable, "-m", "pip", "install", "-r", os.path.join(dest, "requirements.txt")], check=False)
 
-    if not use_comfy and not cm_cli:
-        print("[restore][warn] neither comfy-cli nor cm-cli found; snapshot left staged for Manager UI")
-        return
-    current = {}
-    if run(["save-snapshot", "--output", cur_path]) == 0 and os.path.isfile(cur_path):
-        with open(cur_path, encoding="utf-8") as fh:
-            current = yaml.safe_load(fh) or {}
-    merged = dict(current)
-    merged["git_custom_nodes"] = {**missing_git, **(current.get("git_custom_nodes") or {})}
-    merged["cnr_custom_nodes"] = {**missing_cnr, **(current.get("cnr_custom_nodes") or {})}
-    merged["pips"] = {}  # never let a backup re-pin pip packages (protects CUDA torch stack)
-    with open(merged_path, "w", encoding="utf-8") as fh:
-        yaml.safe_dump(merged, fh, sort_keys=False)
-    rc = run(["restore-snapshot", merged_path])
-    print(f"[restore] snapshot restore exit code {rc}")
+    # 2. Install missing CNR custom nodes at latest registry release (no version pinning)
+    for node_name in to_install_cnr:
+        print(f"[restore] installing CNR custom node (latest): {node_name}")
+        if cm_cli:
+            subprocess.run([sys.executable, cm_cli, "install", node_name], cwd=comfy, env=env, check=False)
+        elif use_comfy:
+            subprocess.run(["comfy", "--here", "--skip-prompt", "node", "install", node_name], cwd=comfy, env=env, check=False)
+        else:
+            print(f"[restore][warn] skipping CNR node {node_name}: neither cm-cli nor comfy-cli found")
 
 
 if mode == "nodes":
@@ -2187,6 +2223,9 @@ if [[ "${RESTORE_BACKUP:-0}" == "1" && -n "${COMFYUI_BACKUP:-}" && -d "/workspac
     if hfd_restore nodes; then
       RESTORE_JUST_RAN=1
       touch /workspace/.restore_nodes_done
+      # Clear any legacy restore-snapshot actions scheduled by ComfyUI-Manager
+      rm -f /workspace/ComfyUI/user/*/ComfyUI-Manager/startup-scripts/restore-snapshot.* \
+            /workspace/ComfyUI/user/__manager/startup-scripts/restore-snapshot.* 2>/dev/null || true
       echo "[restore] custom nodes restore complete"
     else
       echo "[restore][error] custom nodes restore failed; will retry on next boot"
