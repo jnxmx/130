@@ -2493,8 +2493,21 @@ launch_comfyui_runtime() {
   if [[ "${DISABLE_PM:-0}" == "1" ]]; then
     comfy_args+=(--disable-pinned-memory)
   fi
+  local is_blackwell=0
   if [[ "${DISABLE_CUDA_MALLOC:-0}" == "1" ]]; then
-    echo "[gpu] DISABLE_CUDA_MALLOC=1 set; appending --disable-cuda-malloc"
+    is_blackwell=1
+  elif nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -qiE 'RTX 50|Blackwell|B100|B200|GB200|B300'; then
+    is_blackwell=1
+  else
+    local ccap
+    ccap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | cut -d'.' -f1 || echo 0)"
+    if [[ "${ccap:-0}" =~ ^[0-9]+$ ]] && (( ccap >= 10 )); then
+      is_blackwell=1
+    fi
+  fi
+  if (( is_blackwell == 1 )); then
+    echo "[gpu] Blackwell family detected; using native PyTorch allocator with expandable_segments:True"
+    export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
     comfy_args+=(--disable-cuda-malloc)
   fi
   if [[ -n "${RESERVE_VRAM:-}" ]]; then
