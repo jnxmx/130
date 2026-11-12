@@ -2506,9 +2506,8 @@ launch_comfyui_runtime() {
     fi
   fi
   if (( is_blackwell == 1 )); then
-    echo "[gpu] Blackwell family detected; using native PyTorch allocator with expandable_segments:True"
-    export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-    comfy_args+=(--disable-cuda-malloc)
+    echo "[gpu] Blackwell family detected; using cudaMallocAsync with release_threshold:0.8"
+    export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-backend:cudaMallocAsync,release_threshold:0.8}"
   fi
   if [[ -n "${RESERVE_VRAM:-}" ]]; then
     comfy_args+=(--reserve-vram "$RESERVE_VRAM")
