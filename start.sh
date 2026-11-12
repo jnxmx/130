@@ -2493,22 +2493,24 @@ launch_comfyui_runtime() {
   if [[ "${DISABLE_PM:-0}" == "1" ]]; then
     comfy_args+=(--disable-pinned-memory)
   fi
-  local is_blackwell=0
   if [[ "${DISABLE_CUDA_MALLOC:-0}" == "1" ]]; then
-    is_blackwell=1
-  elif nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -qiE 'RTX 50|Blackwell|B100|B200|GB200|B300'; then
-    is_blackwell=1
-  else
-    local ccap
-    ccap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | cut -d'.' -f1 || echo 0)"
-    if [[ "${ccap:-0}" =~ ^[0-9]+$ ]] && (( ccap >= 10 )); then
-      is_blackwell=1
-    fi
-  fi
-  if (( is_blackwell == 1 )); then
-    echo "[gpu] Blackwell family (compute capability >= 10.0 / RTX 50 / B100 / B200) detected; appending --disable-cuda-malloc to prevent allocator deadlock"
+    echo "[gpu] DISABLE_CUDA_MALLOC=1 set; appending --disable-cuda-malloc"
     comfy_args+=(--disable-cuda-malloc)
   fi
+  # Ensure VAEDecode unloads unused diffusion models before decoding to free VRAM for large video/image decoders
+  "$VIRTUAL_ENV/bin/python" -c "
+try:
+    with open('nodes.py', 'r') as f:
+        c = f.read()
+    old = '    def decode(self, vae, samples):\n        latent = samples[\"samples\"]'
+    new = '    def decode(self, vae, samples):\n        comfy.model_management.unload_all_models()\n        comfy.model_management.soft_empty_cache(force=True)\n        latent = samples[\"samples\"]'
+    if 'comfy.model_management.unload_all_models()' not in c and old in c:
+        with open('nodes.py', 'w') as f:
+            f.write(c.replace(old, new, 1))
+        print('[patch] Patched VAEDecode to unload diffusion models before decode')
+except Exception as e:
+    print(f'[patch][warn] VAEDecode patch skipped: {e}')
+" 2>/dev/null || true
   if [[ -n "$pin_cores" ]] && command -v taskset >/dev/null 2>&1; then
     if taskset -c "$pin_cores" true >/dev/null 2>&1; then
       echo "[cpu] Applying CPU affinity mask: $pin_cores"
