@@ -2493,8 +2493,20 @@ launch_comfyui_runtime() {
   if [[ "${DISABLE_PM:-0}" == "1" ]]; then
     comfy_args+=(--disable-pinned-memory)
   fi
-  if [[ "${DISABLE_CUDA_MALLOC:-0}" == "1" ]] || nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -qiE 'RTX 50|Blackwell'; then
-    echo "[gpu] RTX 50-series/Blackwell or DISABLE_CUDA_MALLOC detected; appending --disable-cuda-malloc to prevent allocator deadlock"
+  local is_blackwell=0
+  if [[ "${DISABLE_CUDA_MALLOC:-0}" == "1" ]]; then
+    is_blackwell=1
+  elif nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -qiE 'RTX 50|Blackwell|B100|B200|GB200|B300'; then
+    is_blackwell=1
+  else
+    local ccap
+    ccap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | cut -d'.' -f1 || echo 0)"
+    if [[ "${ccap:-0}" =~ ^[0-9]+$ ]] && (( ccap >= 10 )); then
+      is_blackwell=1
+    fi
+  fi
+  if (( is_blackwell == 1 )); then
+    echo "[gpu] Blackwell family (compute capability >= 10.0 / RTX 50 / B100 / B200) detected; appending --disable-cuda-malloc to prevent allocator deadlock"
     comfy_args+=(--disable-cuda-malloc)
   fi
   if [[ -n "$pin_cores" ]] && command -v taskset >/dev/null 2>&1; then
