@@ -22,6 +22,7 @@ echo "========================================================"
 export PYTHONWARNINGS="ignore"
 export PIP_DISABLE_PIP_VERSION_CHECK="1"
 export HF_HUB_DISABLE_TELEMETRY="1"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 ENABLE_RUNTIME_REPO_UPDATES="${ENABLE_RUNTIME_REPO_UPDATES:-1}"
 # Persist pip cache across runs to speed installs
 export PIP_CACHE_DIR="/workspace/.cache/pip"
@@ -1369,15 +1370,62 @@ update_comfyui_core() {
 
   local new="$(git rev-parse HEAD 2>/dev/null || echo)"
   if [[ -f requirements.txt ]]; then
+    local need_install=0
     if [[ "$old" != "$new" ]]; then
-      if git diff --quiet "$old" "$new" -- requirements.txt 2>/dev/null; then
-        echo "[deps] requirements.txt unchanged in ComfyUI core; skipping reinstall"
-      else
+      if ! git diff --quiet "$old" "$new" -- requirements.txt 2>/dev/null; then
         echo "[deps] requirements.txt updated in ComfyUI core; installing packages"
-        install_comfyui_core_requirements "$VIRTUAL_ENV/bin/python" requirements.txt || true
+        need_install=1
       fi
-    else
-      echo "[deps] ComfyUI core is already at commit ${new:0:7}; requirements check skipped"
+    fi
+    if [[ "$need_install" -eq 0 ]]; then
+      # Verify that ComfyUI core requirements (excluding torch stack) are satisfied in venv
+      if ! "$VIRTUAL_ENV/bin/python" -c '
+import sys, importlib.metadata
+try:
+    from packaging.requirements import Requirement
+except ImportError:
+    Requirement = None
+
+missing = False
+with open("requirements.txt") as f:
+    for raw in f:
+        line = raw.strip().split("#")[0].strip()
+        if not line or line.startswith(("-", "http", "git+")):
+            continue
+        if Requirement:
+            try:
+                req = Requirement(line)
+                name = req.name.lower()
+                if name in {"torch", "torchvision", "torchaudio", "triton"}:
+                    continue
+                ver = importlib.metadata.version(req.name)
+                if req.specifier and not req.specifier.contains(ver, prereleases=True):
+                    missing = True
+                    break
+            except Exception:
+                missing = True
+                break
+        else:
+            pkg = line.split("==")[0].split(">=")[0].split("<=")[0].strip()
+            if pkg.lower() in {"torch", "torchvision", "torchaudio", "triton"}:
+                continue
+            try:
+                importlib.metadata.version(pkg)
+            except Exception:
+                missing = True
+                break
+if missing:
+    sys.exit(1)
+' 2>/dev/null; then
+        echo "[deps] ComfyUI core requirements not fully satisfied in venv; installing packages"
+        need_install=1
+      else
+        echo "[deps] ComfyUI core requirements already satisfied in venv; skipping reinstall"
+      fi
+    fi
+
+    if [[ "$need_install" -eq 1 ]]; then
+      install_comfyui_core_requirements "$VIRTUAL_ENV/bin/python" requirements.txt || true
     fi
   fi
 }
@@ -2505,8 +2553,9 @@ launch_comfyui_runtime() {
       is_blackwell=1
     fi
   fi
+  export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
   if (( is_blackwell == 1 )); then
-    echo "[gpu] Blackwell family detected; using native cudaMallocAsync"
+    echo "[gpu] Blackwell family detected; using native cudaMallocAsync with expandable_segments:True"
   fi
   if [[ -n "${RESERVE_VRAM:-}" ]]; then
     comfy_args+=(--reserve-vram "$RESERVE_VRAM")
