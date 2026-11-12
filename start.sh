@@ -2497,20 +2497,9 @@ launch_comfyui_runtime() {
     echo "[gpu] DISABLE_CUDA_MALLOC=1 set; appending --disable-cuda-malloc"
     comfy_args+=(--disable-cuda-malloc)
   fi
-  # Ensure VAEDecode unloads unused diffusion models before decoding to free VRAM for large video/image decoders
-  "$VIRTUAL_ENV/bin/python" -c "
-try:
-    with open('nodes.py', 'r') as f:
-        c = f.read()
-    old = '    def decode(self, vae, samples):\n        latent = samples[\"samples\"]'
-    new = '    def decode(self, vae, samples):\n        comfy.model_management.unload_all_models()\n        comfy.model_management.soft_empty_cache(force=True)\n        latent = samples[\"samples\"]'
-    if 'comfy.model_management.unload_all_models()' not in c and old in c:
-        with open('nodes.py', 'w') as f:
-            f.write(c.replace(old, new, 1))
-        print('[patch] Patched VAEDecode to unload diffusion models before decode')
-except Exception as e:
-    print(f'[patch][warn] VAEDecode patch skipped: {e}')
-" 2>/dev/null || true
+  if [[ -n "${RESERVE_VRAM:-}" ]]; then
+    comfy_args+=(--reserve-vram "$RESERVE_VRAM")
+  fi
   if [[ -n "$pin_cores" ]] && command -v taskset >/dev/null 2>&1; then
     if taskset -c "$pin_cores" true >/dev/null 2>&1; then
       echo "[cpu] Applying CPU affinity mask: $pin_cores"
