@@ -2493,6 +2493,10 @@ launch_comfyui_runtime() {
   if [[ "${DISABLE_PM:-0}" == "1" ]]; then
     comfy_args+=(--disable-pinned-memory)
   fi
+  if [[ "${DISABLE_CUDA_MALLOC:-0}" == "1" ]] || nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -qiE 'RTX 50|Blackwell'; then
+    echo "[gpu] RTX 50-series/Blackwell or DISABLE_CUDA_MALLOC detected; appending --disable-cuda-malloc to prevent allocator deadlock"
+    comfy_args+=(--disable-cuda-malloc)
+  fi
   if [[ -n "$pin_cores" ]] && command -v taskset >/dev/null 2>&1; then
     if taskset -c "$pin_cores" true >/dev/null 2>&1; then
       echo "[cpu] Applying CPU affinity mask: $pin_cores"
