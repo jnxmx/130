@@ -115,27 +115,19 @@ pip_install() {
   if [[ "$USE_UV" == "1" ]]; then
     local link_mode
     link_mode="$(uv_link_mode_for_python "$py")"
-    UV_LINK_MODE="$link_mode" uv pip install --python "$py" "${constraint_args[@]}" "$@"
-  else
-    "$py" -m pip install "${constraint_args[@]}" "$@"
+    if UV_LINK_MODE="$link_mode" uv pip install --python "$py" "${constraint_args[@]}" "$@"; then
+      return 0
+    fi
+    echo "[deps][warn] uv pip install failed; falling back to pip..."
   fi
+  "$py" -m pip install "${constraint_args[@]}" "$@"
 }
 
 pip_install_requirements() {
   local py="$1"
   local req="$2"
   shift 2
-  local constraint_args=()
-  if [[ -n "${PIP_CONSTRAINT:-}" ]]; then
-    constraint_args=(--constraint "$PIP_CONSTRAINT")
-  fi
-  if [[ "$USE_UV" == "1" ]]; then
-    local link_mode
-    link_mode="$(uv_link_mode_for_python "$py")"
-    UV_LINK_MODE="$link_mode" uv pip install --python "$py" "${constraint_args[@]}" -r "$req" "$@"
-  else
-    "$py" -m pip install "${constraint_args[@]}" -r "$req" "$@"
-  fi
+  pip_install "$py" -r "$req" "$@"
 }
 
 install_comfyui_core_requirements() {
@@ -1917,11 +1909,9 @@ seed_isolated_comfy_venv() {
   "$sys_py" -m venv "$venv_dir"
 
   "$sys_py" - "$venv_dir" <<'PY'
-import importlib.metadata as ilm
 import os
 import shutil
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 venv_dir = Path(sys.argv[1])
@@ -1947,89 +1937,54 @@ if not sys_site:
     except Exception:
         sys_site = Path("/usr/local/lib/python3.12/dist-packages")
 
-# Discover top-level directories shared across multiple distributions so uv/pip upgrades
-# never mutate files through a shared directory symlink back into /usr/local.
-top_owners = defaultdict(set)
-for dist in ilm.distributions(path=[str(sys_site)]):
-    dist_name = (dist.metadata.get("Name") or "").strip().lower().replace("-", "_")
-    if dist_name == "pip":
-        continue
-    dist_key = dist.name or dist_name or str(getattr(dist, "_path", ""))
-    for rel in (dist.files or []):
-        parts = rel.parts
-        if not parts:
-            continue
-        top = parts[0]
-        if top in ("..", ".", "__pycache__") or top.endswith((".dist-info", ".egg-info")):
-            continue
-        top_owners[top].add(dist_key)
-
-shared_top_dirs = {
-    top for top, owners in top_owners.items()
-    if len(owners) > 1 and (sys_site / top).is_dir()
-}
-
 copied_dist = 0
-linked_shared_children = 0
-linked_top = 0
+created_dirs = 0
+linked_files = 0
 
-# 1. Copy *.dist-info and *.egg-info (except pip-*) so uv sees all preinstalled packages
-for src in sys_site.iterdir():
-    name = src.name
-    if not name.endswith((".dist-info", ".egg-info")) or name.startswith("pip-"):
-        continue
-    dst = target_site / name
-    if dst.exists() or dst.is_symlink():
-        if dst.is_dir() and not dst.is_symlink():
-            shutil.rmtree(dst, ignore_errors=True)
-        else:
-            dst.unlink(missing_ok=True)
-    if src.is_dir():
-        shutil.copytree(src, dst, symlinks=True)
-    else:
-        shutil.copy2(src, dst)
-    copied_dist += 1
-
-# 2. Create real dirs for multi-package top-level namespaces/dirs and symlink their children
-for top in sorted(shared_top_dirs):
-    src_dir = sys_site / top
-    dst_dir = target_site / top
+def seed_dir_tree(src_dir: Path, dst_dir: Path) -> None:
+    global created_dirs, linked_files
     if dst_dir.is_symlink() or dst_dir.is_file():
         dst_dir.unlink(missing_ok=True)
     dst_dir.mkdir(parents=True, exist_ok=True)
-    for child in src_dir.iterdir():
-        if child.name == "__pycache__":
+    created_dirs += 1
+    for entry in os.scandir(src_dir):
+        if entry.name == "__pycache__":
             continue
-        dst_child = dst_dir / child.name
-        if dst_child.exists() or dst_child.is_symlink():
-            if dst_child.is_dir() and not dst_child.is_symlink():
-                shutil.rmtree(dst_child, ignore_errors=True)
-            else:
-                dst_child.unlink(missing_ok=True)
-        os.symlink(str(child), str(dst_child))
-        linked_shared_children += 1
+        dst_entry = dst_dir / entry.name
+        if entry.is_dir(follow_symlinks=True):
+            # Recursively materialize real dirs at every depth so `uv` uninstalls
+            # never hit a symlinked directory (ENOTDIR / os error 20).
+            seed_dir_tree(Path(entry.path), dst_entry)
+        elif not dst_entry.exists() and not dst_entry.is_symlink():
+            os.symlink(entry.path, dst_entry)
+            linked_files += 1
 
-# 3. Symlink all other top-level entries (skip pip* and __pycache__)
 for src in sys_site.iterdir():
     name = src.name
-    if (
-        name == "__pycache__"
-        or name == "pip"
-        or name.startswith("pip-")
-        or name.endswith((".dist-info", ".egg-info"))
-        or name in shared_top_dirs
-    ):
+    if name in ("__pycache__", "pip") or name.startswith("pip-"):
         continue
     dst = target_site / name
-    if dst.exists() or dst.is_symlink():
-        continue
-    os.symlink(str(src), str(dst))
-    linked_top += 1
+    if name.endswith((".dist-info", ".egg-info")):
+        if dst.exists() or dst.is_symlink():
+            if dst.is_dir() and not dst.is_symlink():
+                shutil.rmtree(dst, ignore_errors=True)
+            else:
+                dst.unlink(missing_ok=True)
+        if src.is_dir():
+            shutil.copytree(src, dst, symlinks=True)
+        else:
+            shutil.copy2(src, dst)
+        copied_dist += 1
+    elif src.is_dir():
+        seed_dir_tree(src, dst)
+    else:
+        if not dst.exists() and not dst.is_symlink():
+            os.symlink(str(src), str(dst))
+            linked_files += 1
 
 print(
     f"[venv] seeded isolated venv from {sys_site}: "
-    f"copied_dist={copied_dist}, shared_dirs={sorted(shared_top_dirs)}, "
-    f"shared_children={linked_shared_children}, top_links={linked_top}"
+    f"copied_dist={copied_dist}, dirs={created_dirs}, file_links={linked_files}"
 )
 PY
 }
@@ -2198,7 +2153,19 @@ activate_comfy_venv
 
 if [[ "${NEW_MANAGER:-0}" == "1" ]]; then
   echo "STAGE: Ensuring ComfyUI Manager (pip)"
-  pip_install "$VIRTUAL_ENV/bin/python" --upgrade comfyui-manager
+  if [[ "$USE_UV" == "1" ]]; then
+    _mgr_link_mode="$(uv_link_mode_for_python "$VIRTUAL_ENV/bin/python")"
+    _mgr_cargs=()
+    if [[ -n "${PIP_CONSTRAINT:-}" ]]; then
+      _mgr_cargs=(--constraint "$PIP_CONSTRAINT")
+    fi
+    if ! UV_LINK_MODE="$_mgr_link_mode" uv pip install --python "$VIRTUAL_ENV/bin/python" "${_mgr_cargs[@]}" --upgrade-package comfyui-manager comfyui-manager; then
+      echo "[deps][warn] uv manager install failed; falling back to pip..."
+      USE_UV=0 pip_install "$VIRTUAL_ENV/bin/python" --upgrade comfyui-manager
+    fi
+  else
+    pip_install "$VIRTUAL_ENV/bin/python" --upgrade comfyui-manager
+  fi
 else
   echo "[manager] NEW_MANAGER!=1; skipping pip-installed Manager"
 fi
