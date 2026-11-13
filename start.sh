@@ -8,8 +8,8 @@ LOG_FILE="/server.log"
 : > "$LOG_FILE"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-# Default venv (must be at the very top)
-: "${VIRTUAL_ENV:=/workspace/ComfyUI/venv}"
+# Default venv (local container disk for fast IO; persisted via /workspace/.comfy_venv.tar.lz4)
+: "${VIRTUAL_ENV:=/opt/comfyui-venv}"
 export VIRTUAL_ENV
 
 # Container script version marker
@@ -21,11 +21,13 @@ echo "========================================================"
 # Quiet noisy warnings and pip notices globally
 export PYTHONWARNINGS="ignore"
 export PIP_DISABLE_PIP_VERSION_CHECK="1"
+export PIP_NO_COMPILE="${PIP_NO_COMPILE:-1}"
 export HF_HUB_DISABLE_TELEMETRY="1"
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 ENABLE_RUNTIME_REPO_UPDATES="${ENABLE_RUNTIME_REPO_UPDATES:-1}"
-# Persist pip cache across runs to speed installs
-export PIP_CACHE_DIR="/workspace/.cache/pip"
+# Keep pip/uv caches on local container disk (fast IO, pruned after installs)
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/root/.cache/pip}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-/root/.cache/uv}"
+mkdir -p "$PIP_CACHE_DIR" "$UV_CACHE_DIR" 2>/dev/null || true
 PYTORCH_WHL_INDEX="${PYTORCH_WHL_INDEX:-https://download.pytorch.org/whl/cu130}"
 if [[ -z "${PIP_EXTRA_INDEX_URL:-}" ]]; then
   export PIP_EXTRA_INDEX_URL="$PYTORCH_WHL_INDEX"
@@ -45,20 +47,29 @@ if [[ -n "${PIP_CONSTRAINT:-}" ]]; then
 fi
 echo "[deps] extra package index: $PYTORCH_WHL_INDEX"
 
-# --- Optional uv (fast installer) ---
+# --- Optional uv (fast installer; enabled by default) ---
+MANAGER_USE_UV="${MANAGER_USE_UV:-1}"
+export MANAGER_USE_UV
 USE_UV="${USE_UV:-}"
 if [[ -z "${USE_UV}" ]]; then
-  for cfg in /workspace/ComfyUI/user/__manager/config.ini /Comfy/user/__manager/config.ini; do
-    if [[ -f "$cfg" ]]; then
-      uv_val="$(awk -F= '/^\s*use_uv\s*=/{gsub(/[[:space:]]/,"",$2); print tolower($2); exit}' "$cfg")"
-      case "$uv_val" in
-        true|1|yes) USE_UV=1 ;;
-      esac
-      break
-    fi
-  done
+  case "$(echo "${MANAGER_USE_UV}" | tr '[:upper:]' '[:lower:]')" in
+    0|false|no|off)
+      USE_UV=0
+      for cfg in /workspace/ComfyUI/user/__manager/config.ini /Comfy/user/__manager/config.ini; do
+        if [[ -f "$cfg" ]]; then
+          uv_val="$(awk -F= '/^\s*use_uv\s*=/{gsub(/[[:space:]]/,"",$2); print tolower($2); exit}' "$cfg")"
+          case "$uv_val" in
+            true|1|yes) USE_UV=1 ;;
+          esac
+          break
+        fi
+      done
+      ;;
+    *)
+      USE_UV=1
+      ;;
+  esac
 fi
-USE_UV="${USE_UV:-0}"
 if [[ "$USE_UV" == "1" ]] && ! command -v uv >/dev/null 2>&1; then
   echo "[warn] USE_UV=1 but uv not found; falling back to pip"
   USE_UV=0
@@ -78,6 +89,22 @@ else
   echo "[comfyui] stable update policy enabled by default (NIGHTLY_COMFYUI=0)"
 fi
 
+uv_link_mode_for_python() {
+  local py="$1"
+  local py_dir cache_dir py_dev cache_dev
+  py_dir="$(dirname "$(dirname "$py")")"
+  [[ -d "$py_dir" ]] || py_dir="$VIRTUAL_ENV"
+  cache_dir="${UV_CACHE_DIR:-/root/.cache/uv}"
+  mkdir -p "$cache_dir" 2>/dev/null || true
+  py_dev="$(stat -c '%d' "$py_dir" 2>/dev/null || true)"
+  cache_dev="$(stat -c '%d' "$cache_dir" 2>/dev/null || true)"
+  if [[ -n "$py_dev" && -n "$cache_dev" && "$py_dev" == "$cache_dev" ]]; then
+    echo "hardlink"
+  else
+    echo "copy"
+  fi
+}
+
 pip_install() {
   local py="$1"
   shift
@@ -86,7 +113,9 @@ pip_install() {
     constraint_args=(--constraint "$PIP_CONSTRAINT")
   fi
   if [[ "$USE_UV" == "1" ]]; then
-    uv pip install --python "$py" "${constraint_args[@]}" "$@"
+    local link_mode
+    link_mode="$(uv_link_mode_for_python "$py")"
+    UV_LINK_MODE="$link_mode" uv pip install --python "$py" "${constraint_args[@]}" "$@"
   else
     "$py" -m pip install "${constraint_args[@]}" "$@"
   fi
@@ -101,7 +130,9 @@ pip_install_requirements() {
     constraint_args=(--constraint "$PIP_CONSTRAINT")
   fi
   if [[ "$USE_UV" == "1" ]]; then
-    uv pip install --python "$py" "${constraint_args[@]}" -r "$req" "$@"
+    local link_mode
+    link_mode="$(uv_link_mode_for_python "$py")"
+    UV_LINK_MODE="$link_mode" uv pip install --python "$py" "${constraint_args[@]}" -r "$req" "$@"
   else
     "$py" -m pip install "${constraint_args[@]}" -r "$req" "$@"
   fi
@@ -112,12 +143,15 @@ install_comfyui_core_requirements() {
   local req="$2"
   shift 2
 
+  local constraint_args=()
+  if [[ -n "${PIP_CONSTRAINT:-}" ]]; then
+    constraint_args=(--constraint "$PIP_CONSTRAINT")
+  fi
+
   local use_uv_core="${RUNTIME_USE_UV:-1}"
   if [[ "$use_uv_core" == "1" ]] && command -v uv >/dev/null 2>&1; then
-    local constraint_args=()
-    if [[ -n "${PIP_CONSTRAINT:-}" ]]; then
-      constraint_args=(--constraint "$PIP_CONSTRAINT")
-    fi
+    local link_mode
+    link_mode="$(uv_link_mode_for_python "$py")"
 
     # Filter out system CUDA 13 PyTorch stack packages already preinstalled in the image
     local filtered_req
@@ -126,14 +160,14 @@ install_comfyui_core_requirements() {
 
     # Dry-run guard: ensure uv does not attempt to resolve or change torch/CUDA ecosystem packages
     local dry_run_out=""
-    dry_run_out="$(UV_LINK_MODE=copy UV_CONCURRENT_DOWNLOADS=16 uv pip install --python "$py" "${constraint_args[@]}" --dry-run -r "$filtered_req" 2>&1 || true)"
+    dry_run_out="$(UV_LINK_MODE="$link_mode" UV_CONCURRENT_DOWNLOADS=16 uv pip install --python "$py" "${constraint_args[@]}" --dry-run -r "$filtered_req" 2>&1 || true)"
 
-    if echo "$dry_run_out" | grep -qE '^\s*(\+|\~|\-)\s*(torch|torchvision|torchaudio|nvidia-|triton|onnxruntime|xformers|bitsandbytes)\b'; then
+    if echo "$dry_run_out" | grep -qE '^\s*(\+|\~|\-)\s*(torch|torchvision|torchaudio|nvidia-|triton|onnxruntime|xformers|bitsandbytes|torchcodec)\b'; then
       echo "[deps][warn] uv dry-run detected torch/CUDA ecosystem package in plan; falling back to pip to preserve system torch"
       rm -f "$filtered_req"
     else
-      echo "[deps] installing ComfyUI core requirements via uv (parallel downloads)..."
-      if env UV_LINK_MODE=copy UV_CONCURRENT_DOWNLOADS=16 UV_EXTRA_INDEX_URL="" PIP_EXTRA_INDEX_URL="" \
+      echo "[deps] installing ComfyUI core requirements via uv (parallel downloads, link_mode=$link_mode)..."
+      if env UV_LINK_MODE="$link_mode" UV_CONCURRENT_DOWNLOADS=16 UV_EXTRA_INDEX_URL="" PIP_EXTRA_INDEX_URL="" \
           uv pip install --python "$py" "${constraint_args[@]}" -r "$filtered_req" "$@"; then
         rm -f "$filtered_req"
         echo "[deps] ComfyUI core requirements installed via uv."
@@ -145,7 +179,7 @@ install_comfyui_core_requirements() {
   fi
 
   # Fallback: standard pip install without slow PyTorch index for core requirements
-  env PIP_EXTRA_INDEX_URL="" "$py" -m pip install -r "$req" "$@"
+  env PIP_EXTRA_INDEX_URL="" "$py" -m pip install "${constraint_args[@]}" -r "$req" "$@"
 }
 
 run_with_manager_pip_env() {
@@ -1337,11 +1371,11 @@ update_comfyui_core() {
     remote_master="$(GIT_TERMINAL_PROMPT=0 git ls-remote origin refs/heads/master 2>/dev/null | awk '{print $1}' | head -n 1 || true)"
     if [[ -n "$remote_master" && "$old" == "$remote_master" ]]; then
       echo "[updates] ComfyUI core already at latest master (${old:0:7}); skipping fetch"
-      return 0
+    else
+      echo "[updates] NIGHTLY_COMFYUI=1; fetching latest ComfyUI master commit..."
+      GIT_TERMINAL_PROMPT=0 git fetch --depth 1 origin master --quiet 2>/dev/null || GIT_TERMINAL_PROMPT=0 git fetch origin master 2>/dev/null || true
+      git checkout -B master FETCH_HEAD 2>/dev/null || git reset --hard FETCH_HEAD 2>/dev/null || true
     fi
-    echo "[updates] NIGHTLY_COMFYUI=1; fetching latest ComfyUI master commit..."
-    GIT_TERMINAL_PROMPT=0 git fetch --depth 1 origin master --quiet 2>/dev/null || GIT_TERMINAL_PROMPT=0 git fetch origin master 2>/dev/null || true
-    git checkout -B master FETCH_HEAD 2>/dev/null || git reset --hard FETCH_HEAD 2>/dev/null || true
   else
     local latest_tag=""
     latest_tag="$(GIT_TERMINAL_PROMPT=0 git ls-remote --tags --refs origin 'v[0-9]*' 2>/dev/null | awk -F'refs/tags/' 'NF>1{print $2}' | sort -V | tail -n 1 || true)"
@@ -1357,12 +1391,12 @@ update_comfyui_core() {
       local_tag_sha="$(git rev-parse -q --verify "refs/tags/${latest_tag}^{commit}" 2>/dev/null || true)"
       if [[ -n "$local_tag_sha" && "$old" == "$local_tag_sha" ]]; then
         echo "[updates] ComfyUI core already on latest stable tag ${latest_tag} (${old:0:7}); skipping fetch"
-        return 0
+      else
+        echo "[updates] Updating ComfyUI core to latest stable tag: ${latest_tag}"
+        GIT_TERMINAL_PROMPT=0 git fetch --depth 1 origin "refs/tags/${latest_tag}:refs/tags/${latest_tag}" --quiet 2>/dev/null \
+          || GIT_TERMINAL_PROMPT=0 git fetch --tags origin 2>/dev/null || true
+        git checkout -f "$latest_tag" --quiet 2>/dev/null || git checkout -f "$latest_tag" 2>/dev/null || true
       fi
-      echo "[updates] Updating ComfyUI core to latest stable tag: ${latest_tag}"
-      GIT_TERMINAL_PROMPT=0 git fetch --depth 1 origin "refs/tags/${latest_tag}:refs/tags/${latest_tag}" --quiet 2>/dev/null \
-        || GIT_TERMINAL_PROMPT=0 git fetch --tags origin 2>/dev/null || true
-      git checkout -f "$latest_tag" --quiet 2>/dev/null || git checkout -f "$latest_tag" 2>/dev/null || true
     else
       echo "[updates][warn] Could not determine latest tag; keeping current version"
     fi
@@ -1586,13 +1620,13 @@ blacklist_path.write_text(
     encoding="utf-8",
 )
 PY
-      MANAGER_CONFIG_FILE="$config_file" MANAGER_USE_UV="${MANAGER_USE_UV:-0}" MANAGER_NIGHTLY_COMFYUI="${NIGHTLY_COMFYUI:-0}" python - <<'PY'
+      MANAGER_CONFIG_FILE="$config_file" MANAGER_USE_UV="${MANAGER_USE_UV:-1}" MANAGER_NIGHTLY_COMFYUI="${NIGHTLY_COMFYUI:-0}" python - <<'PY'
 from pathlib import Path
 import configparser
 import os
 
 config_path = Path(os.environ["MANAGER_CONFIG_FILE"])
-desired_uv_raw = os.environ.get("MANAGER_USE_UV", "0").strip().lower()
+desired_uv_raw = os.environ.get("MANAGER_USE_UV", "1").strip().lower()
 desired_uv = "true" if desired_uv_raw in {"1", "true", "yes", "on"} else "false"
 
 nightly_raw = os.environ.get("MANAGER_NIGHTLY_COMFYUI", "0").strip().lower()
@@ -1780,9 +1814,344 @@ cleanup_legacy_manager_settings_dir() {
 
 ## moved below backup restore to avoid being overwritten
 
-# --- First boot: persist ComfyUI into /workspace and fetch taesd ---
+COMFY_VENV_ARCHIVE="${COMFY_VENV_ARCHIVE:-/workspace/.comfy_venv.tar.lz4}"
+COMFY_VENV_STAMP_FILE="${COMFY_VENV_STAMP_FILE:-/workspace/.comfy_venv.stamp}"
+COMFY_VENV_SAVE_LOCK_DIR="/tmp/comfy_venv_save.lock.d"
+COMFY_VENV_SAVED_FP_FILE="/tmp/.comfy_venv_saved_fp"
+
+comfy_venv_system_python() {
+  if [[ -x /usr/bin/python3 ]]; then
+    echo /usr/bin/python3
+  else
+    command -v python3
+  fi
+}
+
+comfy_venv_base_stamp() {
+  local sys_py
+  sys_py="$(comfy_venv_system_python)"
+  "$sys_py" - <<'PY'
+import hashlib, os, sys
+from pathlib import Path
+
+sys_site = None
+for c in [
+    f"/usr/local/lib/python{sys.version_info.major}.{sys.version_info.minor}/dist-packages",
+    "/usr/local/lib/python3.12/dist-packages",
+    "/usr/lib/python3/dist-packages",
+]:
+    if os.path.isdir(os.path.join(c, "torch")):
+        sys_site = Path(c)
+        break
+
+try:
+    import torch
+    torch_ver = getattr(torch, "__version__", "unknown")
+except Exception:
+    torch_ver = "none"
+
+c_path = Path(os.environ.get("PIP_CONSTRAINT") or "/etc/pip/constraints.txt")
+c_hash = hashlib.sha256(c_path.read_bytes()).hexdigest()[:16] if c_path.is_file() else "none"
+
+pkg_hasher = hashlib.sha256()
+if sys_site and sys_site.is_dir():
+    names = sorted(
+        p.name for p in sys_site.iterdir()
+        if p.name.endswith((".dist-info", ".egg-info")) and not p.name.startswith("pip-")
+    )
+    pkg_hasher.update("\n".join(names).encode("utf-8"))
+
+print(f"py{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|torch={torch_ver}|constraints={c_hash}|syspkgs={pkg_hasher.hexdigest()[:16]}")
+PY
+}
+
+comfy_venv_dist_fingerprint() {
+  local venv_dir="${1:-$VIRTUAL_ENV}"
+  local sys_py
+  sys_py="$(comfy_venv_system_python)"
+  "$sys_py" - "$venv_dir" <<'PY'
+import hashlib, sys
+from pathlib import Path
+
+venv_dir = Path(sys.argv[1])
+h = hashlib.sha256()
+sp = next((d for d in sorted(venv_dir.glob("lib/python*/site-packages")) if d.is_dir()), None)
+if not sp:
+    print("missing")
+    raise SystemExit(0)
+
+entries = []
+for item in sp.iterdir():
+    name = item.name
+    if name.endswith((".dist-info", ".egg-info")):
+        try:
+            st = item.stat()
+            entries.append(f"{name}:{st.st_mtime_ns}")
+        except OSError:
+            entries.append(name)
+for entry in sorted(entries):
+    h.update((entry + "\n").encode("utf-8"))
+h.update(f"count={len(entries)}".encode("utf-8"))
+print(h.hexdigest())
+PY
+}
+
+is_comfy_venv_healthy() {
+  local venv_dir="${1:-$VIRTUAL_ENV}"
+  local py="$venv_dir/bin/python"
+  [[ -x "$py" ]] || return 1
+  "$py" -c "import torch" 2>/dev/null || return 1
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    "$py" -c "import sys, torch; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null || return 1
+  fi
+  return 0
+}
+
+seed_isolated_comfy_venv() {
+  local venv_dir="${1:-$VIRTUAL_ENV}"
+  local sys_py
+  sys_py="$(comfy_venv_system_python)"
+  echo "Creating venv at $venv_dir…"
+  echo "[venv] Creating isolated venv at $venv_dir and seeding preinstalled system packages..."
+  rm -rf "$venv_dir"
+  "$sys_py" -m venv "$venv_dir"
+
+  "$sys_py" - "$venv_dir" <<'PY'
+import importlib.metadata as ilm
+import os
+import shutil
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+venv_dir = Path(sys.argv[1])
+target_site = next((d for d in sorted(venv_dir.glob("lib/python*/site-packages")) if d.is_dir()), None)
+if not target_site:
+    print("[venv][error] could not locate venv site-packages directory")
+    sys.exit(1)
+
+sys_site = None
+for c in [
+    f"/usr/local/lib/python{sys.version_info.major}.{sys.version_info.minor}/dist-packages",
+    "/usr/local/lib/python3.12/dist-packages",
+    "/usr/lib/python3/dist-packages",
+]:
+    if os.path.isdir(os.path.join(c, "torch")):
+        sys_site = Path(c)
+        break
+
+if not sys_site:
+    try:
+        import torch
+        sys_site = Path(torch.__file__).resolve().parent.parent
+    except Exception:
+        sys_site = Path("/usr/local/lib/python3.12/dist-packages")
+
+# Discover top-level directories shared across multiple distributions so uv/pip upgrades
+# never mutate files through a shared directory symlink back into /usr/local.
+top_owners = defaultdict(set)
+for dist in ilm.distributions(path=[str(sys_site)]):
+    dist_name = (dist.metadata.get("Name") or "").strip().lower().replace("-", "_")
+    if dist_name == "pip":
+        continue
+    dist_key = dist.name or dist_name or str(getattr(dist, "_path", ""))
+    for rel in (dist.files or []):
+        parts = rel.parts
+        if not parts:
+            continue
+        top = parts[0]
+        if top in ("..", ".", "__pycache__") or top.endswith((".dist-info", ".egg-info")):
+            continue
+        top_owners[top].add(dist_key)
+
+shared_top_dirs = {
+    top for top, owners in top_owners.items()
+    if len(owners) > 1 and (sys_site / top).is_dir()
+}
+
+copied_dist = 0
+linked_shared_children = 0
+linked_top = 0
+
+# 1. Copy *.dist-info and *.egg-info (except pip-*) so uv sees all preinstalled packages
+for src in sys_site.iterdir():
+    name = src.name
+    if not name.endswith((".dist-info", ".egg-info")) or name.startswith("pip-"):
+        continue
+    dst = target_site / name
+    if dst.exists() or dst.is_symlink():
+        if dst.is_dir() and not dst.is_symlink():
+            shutil.rmtree(dst, ignore_errors=True)
+        else:
+            dst.unlink(missing_ok=True)
+    if src.is_dir():
+        shutil.copytree(src, dst, symlinks=True)
+    else:
+        shutil.copy2(src, dst)
+    copied_dist += 1
+
+# 2. Create real dirs for multi-package top-level namespaces/dirs and symlink their children
+for top in sorted(shared_top_dirs):
+    src_dir = sys_site / top
+    dst_dir = target_site / top
+    if dst_dir.is_symlink() or dst_dir.is_file():
+        dst_dir.unlink(missing_ok=True)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for child in src_dir.iterdir():
+        if child.name == "__pycache__":
+            continue
+        dst_child = dst_dir / child.name
+        if dst_child.exists() or dst_child.is_symlink():
+            if dst_child.is_dir() and not dst_child.is_symlink():
+                shutil.rmtree(dst_child, ignore_errors=True)
+            else:
+                dst_child.unlink(missing_ok=True)
+        os.symlink(str(child), str(dst_child))
+        linked_shared_children += 1
+
+# 3. Symlink all other top-level entries (skip pip* and __pycache__)
+for src in sys_site.iterdir():
+    name = src.name
+    if (
+        name == "__pycache__"
+        or name == "pip"
+        or name.startswith("pip-")
+        or name.endswith((".dist-info", ".egg-info"))
+        or name in shared_top_dirs
+    ):
+        continue
+    dst = target_site / name
+    if dst.exists() or dst.is_symlink():
+        continue
+    os.symlink(str(src), str(dst))
+    linked_top += 1
+
+print(
+    f"[venv] seeded isolated venv from {sys_site}: "
+    f"copied_dist={copied_dist}, shared_dirs={sorted(shared_top_dirs)}, "
+    f"shared_children={linked_shared_children}, top_links={linked_top}"
+)
+PY
+}
+
+ensure_comfy_venv_ready() {
+  local venv_dir="${1:-$VIRTUAL_ENV}"
+  local archive="${COMFY_VENV_ARCHIVE:-/workspace/.comfy_venv.tar.lz4}"
+  local stamp_file="${COMFY_VENV_STAMP_FILE:-/workspace/.comfy_venv.stamp}"
+  local expected_stamp archived_stamp=""
+
+  expected_stamp="$(comfy_venv_base_stamp)"
+
+  if is_comfy_venv_healthy "$venv_dir"; then
+    return 0
+  fi
+
+  if [[ -f "$archive" && -f "$stamp_file" ]]; then
+    archived_stamp="$(cat "$stamp_file" 2>/dev/null || true)"
+    if [[ "$archived_stamp" == "$expected_stamp" ]]; then
+      echo "Creating venv at $venv_dir…"
+      echo "[venv] Restoring persisted venv from $archive..."
+      rm -rf "$venv_dir"
+      mkdir -p "$venv_dir"
+      if command -v lz4 >/dev/null 2>&1 && lz4 -dc "$archive" | tar -xf - -C "$venv_dir"; then
+        if is_comfy_venv_healthy "$venv_dir"; then
+          comfy_venv_dist_fingerprint "$venv_dir" > "$COMFY_VENV_SAVED_FP_FILE" 2>/dev/null || true
+          echo "[venv] Restored persisted venv successfully."
+          return 0
+        fi
+        echo "[venv][warn] Restored venv failed CUDA/torch health check; rebuilding fresh..."
+      else
+        echo "[venv][warn] Failed to extract $archive; rebuilding fresh..."
+      fi
+    else
+      echo "[venv] Base image changed (stamp mismatch); discarding stale $archive and seeding fresh venv..."
+    fi
+  fi
+
+  seed_isolated_comfy_venv "$venv_dir"
+}
+
+activate_comfy_venv() {
+  if [[ -f "$VIRTUAL_ENV/bin/activate" ]]; then
+    # shellcheck disable=SC1091
+    source "$VIRTUAL_ENV/bin/activate"
+  else
+    echo "Warning: $VIRTUAL_ENV/bin/activate not found; continuing without activation."
+  fi
+  echo "VIRTUAL_ENV: ${VIRTUAL_ENV:-}"
+  echo "PATH: $PATH"
+}
+
+save_comfy_venv_archive() {
+  local venv_dir="${1:-$VIRTUAL_ENV}"
+  local archive="${COMFY_VENV_ARCHIVE:-/workspace/.comfy_venv.tar.lz4}"
+  local stamp_file="${COMFY_VENV_STAMP_FILE:-/workspace/.comfy_venv.stamp}"
+
+  [[ -x "$venv_dir/bin/python" ]] || return 0
+  command -v lz4 >/dev/null 2>&1 || return 0
+  mkdir -p "$(dirname "$archive")" 2>/dev/null || return 1
+
+  local waited=0
+  while ! mkdir "$COMFY_VENV_SAVE_LOCK_DIR" 2>/dev/null; do
+    waited=$((waited + 1))
+    if (( waited >= 120 )); then
+      echo "[venv][warn] Timed out waiting for venv archive lock; skipping save"
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  (
+    trap 'rmdir "$COMFY_VENV_SAVE_LOCK_DIR" 2>/dev/null || true' EXIT
+    local cur_fp saved_fp="" cur_stamp saved_stamp=""
+    cur_fp="$(comfy_venv_dist_fingerprint "$venv_dir" 2>/dev/null || echo "")"
+    [[ -f "$COMFY_VENV_SAVED_FP_FILE" ]] && saved_fp="$(cat "$COMFY_VENV_SAVED_FP_FILE" 2>/dev/null || true)"
+    cur_stamp="$(comfy_venv_base_stamp 2>/dev/null || echo "")"
+    [[ -f "$stamp_file" ]] && saved_stamp="$(cat "$stamp_file" 2>/dev/null || true)"
+
+    if [[ -n "$cur_fp" && "$cur_fp" == "$saved_fp" && -f "$archive" && "$cur_stamp" == "$saved_stamp" ]]; then
+      exit 0
+    fi
+
+    local tmp_archive="${archive}.tmp.$$"
+    local tmp_stamp="${stamp_file}.tmp.$$"
+    echo "[venv] Persisting venv snapshot to $archive..."
+    if tar -cf - -C "$venv_dir" . | lz4 -1 -q > "$tmp_archive"; then
+      printf '%s\n' "$cur_stamp" > "$tmp_stamp"
+      mv -f "$tmp_archive" "$archive"
+      mv -f "$tmp_stamp" "$stamp_file"
+      [[ -n "$cur_fp" ]] && printf '%s\n' "$cur_fp" > "$COMFY_VENV_SAVED_FP_FILE"
+      echo "[venv] Persisted venv snapshot ($(du -sh "$archive" 2>/dev/null | awk '{print $1}'))"
+    else
+      rm -f "$tmp_archive" "$tmp_stamp"
+      echo "[venv][warn] Failed to persist venv snapshot"
+      exit 1
+    fi
+  )
+}
+
+prune_package_caches() {
+  if command -v uv >/dev/null 2>&1; then
+    uv cache prune --ci >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${PIP_CACHE_DIR:-}" && -d "${PIP_CACHE_DIR}" ]]; then
+    rm -rf "${PIP_CACHE_DIR:?}/http" "${PIP_CACHE_DIR:?}/wheels" 2>/dev/null || true
+  fi
+}
+
+# --- Prepare isolated local venv (restore from /workspace archive or seed from system site-packages) ---
+ensure_comfy_venv_ready "$VIRTUAL_ENV"
+activate_comfy_venv
+
+# --- First boot: update baked /Comfy on local container disk before persisting to /workspace ---
 if [[ ! -d /workspace/ComfyUI && -d /Comfy ]]; then
   image_comfy_head="$(current_image_comfy_head)"
+  if [[ "${ENABLE_RUNTIME_REPO_UPDATES:-1}" == "1" ]]; then
+    echo "STAGE: Updating ComfyUI and custom nodes"
+    ( update_comfyui_core /Comfy ) || true
+    update_custom_nodes_parallel /Comfy/custom_nodes || true
+    prune_package_caches
+  fi
   echo "Persisting ComfyUI to /workspace (first boot)…"
   mv /Comfy /workspace/ComfyUI
   write_comfy_image_sync_marker /workspace/ComfyUI "${image_comfy_head:-}"
@@ -1824,30 +2193,8 @@ for _obs_node in "/workspace/ComfyUI/custom_nodes/Comfyui_Minimax_h3_latent_Upsc
   fi
 done
 
-# --- Venv create/activate ---
-if [[ ! -d "$VIRTUAL_ENV" ]]; then
-  echo "Creating venv at $VIRTUAL_ENV…"
-  python3 -m venv "$VIRTUAL_ENV" --system-site-packages
-else
-  # Sanity check: if venv has a broken torch (e.g. CPU torch or mismatched cuDNN from a bad install on persisted volume),
-  # clean shadowed packages in venv site-packages so it cleanly falls through to the base image CUDA 13 PyTorch.
-  if ! "$VIRTUAL_ENV/bin/python" -c "import torch; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
-    echo "[comfyui][warn] venv torch is broken or missing CUDA; cleaning shadowed venv packages to restore system CUDA 13 PyTorch..."
-    for sp in "$VIRTUAL_ENV"/lib/python*/site-packages; do
-      if [[ -d "$sp" ]]; then
-        rm -rf "$sp"/torch* "$sp"/torchvision* "$sp"/torchaudio* "$sp"/nvidia* "$sp"/triton* 2>/dev/null || true
-      fi
-    done
-  fi
-fi
-if [[ -f "$VIRTUAL_ENV/bin/activate" ]]; then
-  # shellcheck disable=SC1091
-  source "$VIRTUAL_ENV/bin/activate"
-else
-  echo "Warning: $VIRTUAL_ENV/bin/activate not found; continuing without activation."
-fi
-echo "VIRTUAL_ENV: ${VIRTUAL_ENV:-}"
-echo "PATH: $PATH"
+# --- Ensure venv active + Manager policies ---
+activate_comfy_venv
 
 if [[ "${NEW_MANAGER:-0}" == "1" ]]; then
   echo "STAGE: Ensuring ComfyUI Manager (pip)"
@@ -2294,6 +2641,38 @@ else
   echo "Backup custom nodes restore skipped."
 fi
 
+# --- Apply baked/runtime defaults in comfy.settings.json (and re-apply after backup restore) ---
+apply_runtime_comfy_settings() {
+  local disable_timer=0
+  if [[ "${DISABLE_SHUTDOWN_TIMER:-0}" == "1" || "${RUNPOD_DISABLE_SHUTDOWN_TIMER:-0}" == "1" || "${DISABLE_TIMER:-0}" == "1" || "${RUNPOD_TIMER_ENABLED:-1}" == "0" ]]; then
+    disable_timer=1
+    export DISABLE_SHUTDOWN_TIMER=1
+    export RUNPOD_DISABLE_SHUTDOWN_TIMER=1
+    export RUNPOD_TIMER_ENABLED=0
+  fi
+
+  local settings tmp
+  for settings in \
+      /workspace/ComfyUI/user/default/comfy.settings.json \
+      /Comfy/user/default/comfy.settings.json; do
+    [[ -f "$settings" ]] || continue
+    tmp="${settings}.tmp"
+    if jq \
+        --arg repo "${COMFYUI_BACKUP-}" \
+        --argjson disable_timer "$disable_timer" \
+        '."loramanager.usage_statistics" = false
+         | ."Comfy.Execution.PreviewMethod" = "taesd"
+         | ."VHS.LatentPreview" = true
+         | (if $repo != "" then ."downloaderbackup.repo_name" = $repo else . end)
+         | (if $disable_timer == 1 then ."runpod.enable_shutdown_timer" = false else . end)' \
+        "$settings" > "$tmp" && mv "$tmp" "$settings"; then
+      echo "[settings] applied runtime defaults in $settings"
+    else
+      rm -f "$tmp"
+    fi
+  done
+}
+
 # Files (input, output, user data) and models are restored in the background (parallel to startup, resumable)
 if [[ "${RESTORE_BACKUP:-0}" == "1" && -n "${COMFYUI_BACKUP:-}" && -d "/workspace/ComfyUI" && ! -f "/workspace/.restore_done" ]]; then
   if HFD_NODE_DIR="$(find_hf_downloader_nodepack)"; then
@@ -2304,6 +2683,7 @@ if [[ "${RESTORE_BACKUP:-0}" == "1" && -n "${COMFYUI_BACKUP:-}" && -d "/workspac
         echo "[restore] starting background files restore (input, output, user data)..."
         if hfd_restore files; then
           touch /workspace/.restore_files_done
+          apply_runtime_comfy_settings
           echo "[restore] background files restore complete"
         else
           echo "[restore][warn] background files restore had failures"
@@ -2359,34 +2739,8 @@ if [[ "${STUDENT_MODE:-0}" != "1" ]]; then
   fi
 fi
 
-# --- Always set downloaderbackup repo in comfy.settings.json when COMFYUI_BACKUP is provided ---
-if [[ -n "${COMFYUI_BACKUP-}" ]]; then
-  for settings in \
-      /workspace/ComfyUI/user/default/comfy.settings.json \
-      /Comfy/user/default/comfy.settings.json; do
-    if [[ -f "$settings" ]]; then
-      tmp="${settings}.tmp"
-      jq --arg v "$COMFYUI_BACKUP" '."downloaderbackup.repo_name" = $v' "$settings" > "$tmp" && mv "$tmp" "$settings"
-      echo "[settings] downloaderbackup.repo_name set in $settings"
-    fi
-  done
-fi
-
-# --- Set runpod shutdown timer setting in comfy.settings.json when env variable provided ---
-if [[ "${DISABLE_SHUTDOWN_TIMER:-0}" == "1" || "${RUNPOD_DISABLE_SHUTDOWN_TIMER:-0}" == "1" || "${DISABLE_TIMER:-0}" == "1" || "${RUNPOD_TIMER_ENABLED:-1}" == "0" ]]; then
-  export DISABLE_SHUTDOWN_TIMER=1
-  export RUNPOD_DISABLE_SHUTDOWN_TIMER=1
-  export RUNPOD_TIMER_ENABLED=0
-  for settings in \
-      /workspace/ComfyUI/user/default/comfy.settings.json \
-      /Comfy/user/default/comfy.settings.json; do
-    if [[ -f "$settings" ]]; then
-      tmp="${settings}.tmp"
-      jq '."runpod.enable_shutdown_timer" = false' "$settings" > "$tmp" && mv "$tmp" "$settings"
-      echo "[settings] runpod.enable_shutdown_timer disabled in $settings"
-    fi
-  done
-fi
+# --- Apply baked/runtime defaults in comfy.settings.json ---
+apply_runtime_comfy_settings
 
 
 # --- Update core + custom nodes when repos change (idempotent) ---
@@ -2398,8 +2752,12 @@ if [[ -d /workspace/ComfyUI ]]; then
     echo "STAGE: Updating ComfyUI and custom nodes"
     update_comfyui_core /workspace/ComfyUI || true
     update_custom_nodes_parallel /workspace/ComfyUI/custom_nodes || true
+    prune_package_caches
   fi
 fi
+
+# Persist any venv changes made during boot/updates asynchronously
+save_comfy_venv_archive "$VIRTUAL_ENV" >/dev/null 2>&1 &
 
 echo "pod started"
 
@@ -2534,28 +2892,30 @@ launch_comfyui_runtime() {
     sleep 0.5
   fi
   echo "STAGE: Starting ComfyUI"
-  local comfy_args=(--listen 0.0.0.0 --port 8188 --enable-cors-header "*")
+  local comfy_args=(--listen 0.0.0.0 --port 8188 --enable-cors-header "*" --preview-method taesd)
   if [[ "${NEW_MANAGER:-0}" == "1" ]]; then
     comfy_args+=(--enable-manager)
   fi
   if [[ "${DISABLE_PM:-0}" == "1" ]]; then
     comfy_args+=(--disable-pinned-memory)
   fi
-  local is_blackwell=0
   if [[ "${DISABLE_CUDA_MALLOC:-0}" == "1" ]]; then
-    is_blackwell=1
-  elif nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -qiE 'RTX 50|Blackwell|B100|B200|GB200|B300'; then
-    is_blackwell=1
+    echo "[gpu] DISABLE_CUDA_MALLOC=1 set; appending --disable-cuda-malloc"
+    comfy_args+=(--disable-cuda-malloc)
   else
-    local ccap
-    ccap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | cut -d'.' -f1 || echo 0)"
-    if [[ "${ccap:-0}" =~ ^[0-9]+$ ]] && (( ccap >= 10 )); then
+    local is_blackwell=0
+    if nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -qiE 'RTX 50|Blackwell|B100|B200|GB200|B300'; then
       is_blackwell=1
+    else
+      local ccap
+      ccap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | cut -d'.' -f1 || echo 0)"
+      if [[ "${ccap:-0}" =~ ^[0-9]+$ ]] && (( ccap >= 10 )); then
+        is_blackwell=1
+      fi
     fi
-  fi
-  export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
-  if (( is_blackwell == 1 )); then
-    echo "[gpu] Blackwell family detected; using native cudaMallocAsync with expandable_segments:True"
+    if (( is_blackwell == 1 )); then
+      echo "[gpu] Blackwell family detected; using native cudaMallocAsync"
+    fi
   fi
   if [[ -n "${RESERVE_VRAM:-}" ]]; then
     comfy_args+=(--reserve-vram "$RESERVE_VRAM")
@@ -2606,6 +2966,15 @@ export -f pip_install_requirements
 export -f prepare_fizgig_runtime
 export -f launch_comfyui_runtime
 export -f launch_fizgig_runtime
+export -f comfy_venv_system_python
+export -f comfy_venv_base_stamp
+export -f comfy_venv_dist_fingerprint
+export -f save_comfy_venv_archive
+export -f prune_package_caches
+export COMFY_VENV_ARCHIVE
+export COMFY_VENV_STAMP_FILE
+export COMFY_VENV_SAVE_LOCK_DIR
+export COMFY_VENV_SAVED_FP_FILE
 export CPU_CONFIRM_REQUIRED
 export CPU_CONTINUE_FILE
 export CPU_WAIT_PORT
@@ -2637,6 +3006,7 @@ spawn_app_session() {
 ## detect_child_pid removed: rely on supervisor shell PID as group leader
 
 start_comfy_app_process() {
+  save_comfy_venv_archive "$VIRTUAL_ENV" >/dev/null 2>&1 &
   stop_placeholder_process COMFY_PLACEHOLDER_PID
   start_comfy_startup_placeholder || true
   ensure_nginx_started || true
@@ -2735,6 +3105,7 @@ switch_to_app() {
     comfyui)
       set_app_runtime_state "comfyui" "$target_app" "stopping-comfyui" "Stopping ComfyUI before starting Fizgig"
       stop_process_group COMFY_APP_PID "ComfyUI"
+      save_comfy_venv_archive "$VIRTUAL_ENV" || true
       set_app_runtime_state "comfyui" "$target_app" "clearing-vram" "Clearing GPU memory after ComfyUI shutdown"
       clear_gpu_runtime_state
       start_comfy_switch_placeholder || true
@@ -2773,6 +3144,15 @@ if [[ "$CURRENT_MAIN_APP" != "fizgig" ]]; then
   echo "[fizgig] Triggering background preparation of Fizgig runtime..."
   prepare_fizgig_runtime &
 fi
+
+handle_supervisor_shutdown() {
+  echo "[shutdown] Signal received; flushing persisted venv snapshot before exit..."
+  save_comfy_venv_archive "$VIRTUAL_ENV" || true
+  stop_process_group COMFY_APP_PID "ComfyUI" || true
+  stop_process_group FIZGIG_APP_PID "Fizgig" || true
+  exit 0
+}
+trap handle_supervisor_shutdown TERM INT
 
 while true; do
   desired_app="$(normalize_app_name "$(read_state_value "$APP_DESIRED_FILE" "$CURRENT_MAIN_APP")")"

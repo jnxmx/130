@@ -96,7 +96,8 @@ RUN pip install --no-cache-dir -r requirements.txt && \
         packaging \
         pyyaml \
         torchcodec \
-        ninja 
+        ninja \
+        comfyui-manager
 
 # Clone and install custom nodes
 ENV CUSTOM_NODES="jnxmx/ComfyUI_HuggingFace_Downloader kijai/ComfyUI-KJNodes Fannovel16/comfyui_controlnet_aux crystian/ComfyUI-Crystools Kosinkadink/ComfyUI-VideoHelperSuite willmiao/ComfyUI-Lora-Manager city96/ComfyUI-GGUF Fannovel16/ComfyUI-Frame-Interpolation lquesada/ComfyUI-Inpaint-CropAndStitch ssitu/ComfyUI_UltimateSDUpscale Comfy-Org/ComfyUI-Manager Comfy-Org/ComfyUI_Nvidia_VFX_Nodes jnxmx/ComfyUI-RunPod-Control xmarre/ComfyUI-Spectrum-MiniMax-H3"
@@ -186,8 +187,8 @@ ENV HF_HOME="/workspace/.cache/huggingface" \
     HUGGINGFACE_HUB_CACHE="/workspace/.cache/huggingface/hub/" \
     HUGGINGFACE_ASSETS_CACHE="/workspace/.cache/huggingface/assets/" \
     VIRTUALENV_OVERRIDE_APP_DATA="/workspace/.cache/virtualenv/" \
-    PIP_CACHE_DIR="/workspace/.cache/pip/" \
-    UV_CACHE_DIR="/workspace/.cache/uv/" \
+    PIP_CACHE_DIR="/root/.cache/pip/" \
+    UV_CACHE_DIR="/root/.cache/uv/" \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     TRANSFORMERS_CACHE="/workspace/.cache/huggingface/transformers" \
     INSIGHTFACE_HOME="/workspace/.cache/insightface" \

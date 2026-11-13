@@ -4,6 +4,7 @@
     "KJNodes.nodeAutoColor": false,
     "Comfy.WidgetControlMode": "before",
     "Crystools.ShowHdd": true,
+    "VHS.LatentPreview": true,
     "Comfy.Locale": "en",
     "Comfy.ColorPalette": "nord",
     "pysssss.ImageFeed.Location": "hidden",
@@ -32,12 +33,13 @@
     "Comfy.Sidebar.Style": "floating",
     "Comfy.Sidebar.Location": "left",
     "Comfy.Sidebar.Size": "normal",
-    "Comfy.Execution.PreviewMethod": "default",
+    "Comfy.Execution.PreviewMethod": "taesd",
     "Comfy.Templates.SelectedRunsOn": [
         "ComfyUI"
     ],
     "Comfy.VueNodes.Enabled": true,
     "Comfy.Workflow.Default": "empty",
     "Comfy.Workspace.WorkflowOnLoad": "empty",
-    "Crystools.ShowCpu": false
+    "Crystools.ShowCpu": false,
+    "loramanager.usage_statistics": false
 }
