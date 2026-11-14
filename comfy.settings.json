@@ -39,8 +39,6 @@
         "ComfyUI"
     ],
     "Comfy.VueNodes.Enabled": true,
-    "Comfy.Workflow.Default": "empty",
-    "Comfy.Workspace.WorkflowOnLoad": "empty",
     "Crystools.ShowCpu": false,
     "loramanager.usage_statistics": false
 }

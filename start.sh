@@ -1358,6 +1358,9 @@ update_comfyui_core() {
   cd "$target_dir" || return
   local old="$(git rev-parse HEAD 2>/dev/null || echo)"
 
+  # Restore default_workflow.json if patched locally so git pull/checkout stays clean.
+  git checkout -- default_workflow.json 2>/dev/null || true
+
   if [[ "${NIGHTLY_COMFYUI:-0}" == "1" ]]; then
     local remote_master=""
     remote_master="$(GIT_TERMINAL_PROMPT=0 git ls-remote origin refs/heads/master 2>/dev/null | awk '{print $1}' | head -n 1 || true)"
@@ -2701,7 +2704,9 @@ apply_runtime_comfy_settings() {
     if jq \
         --arg repo "${COMFYUI_BACKUP-}" \
         --argjson disable_timer "$disable_timer" \
-        '."loramanager.usage_statistics" = false
+        '."Comfy.TutorialCompleted" = true
+         | del(."Comfy.Workflow.Default", ."Comfy.Workspace.WorkflowOnLoad")
+         | ."loramanager.usage_statistics" = false
          | ."Comfy.Execution.PreviewMethod" = "taesd"
          | ."VHS.LatentPreview" = true
          | ."Crystools.MonitorHeight" = 16
@@ -2960,6 +2965,186 @@ configure_cpu_thread_limits() {
   echo "[cpu] Thread pool configured: OMP_NUM_THREADS=${OMP_NUM_THREADS} OMP_WAIT_POLICY=${OMP_WAIT_POLICY} KMP_BLOCKTIME=${KMP_BLOCKTIME} (host_nproc=${host_cpus}, cgroup_cpus=${cg_cpus:-none})"
 }
 
+ensure_empty_default_workflow() {
+  local py_bin=""
+  if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
+    py_bin="${VIRTUAL_ENV}/bin/python"
+  elif command -v python3 >/dev/null 2>&1; then
+    py_bin="$(command -v python3)"
+  else
+    echo "[workflow][warn] python3 not found; skipping empty default workflow enforcement"
+    return 0
+  fi
+
+  "$py_bin" - <<'PY' || echo "[workflow][warn] empty default workflow setup encountered an error"
+import glob
+import importlib.util
+import json
+import os
+import re
+
+BLANK_GRAPH = {
+    "last_node_id": 0,
+    "last_link_id": 0,
+    "nodes": [],
+    "links": [],
+    "groups": [],
+    "config": {},
+    "extra": {},
+    "version": 0.4,
+}
+
+
+def update_settings_file(path: str) -> None:
+    parent = os.path.dirname(path)
+    if not os.path.isdir(parent):
+        return
+    data = {}
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read().strip()
+        if raw:
+            loaded = json.loads(raw)
+            if not isinstance(loaded, dict):
+                raise ValueError(f"Expected JSON object in {path}")
+            data = loaded
+    changed = (
+        data.get("Comfy.TutorialCompleted") is not True
+        or "Comfy.Workflow.Default" in data
+        or "Comfy.Workspace.WorkflowOnLoad" in data
+    )
+    data["Comfy.TutorialCompleted"] = True
+    data.pop("Comfy.Workflow.Default", None)
+    data.pop("Comfy.Workspace.WorkflowOnLoad", None)
+    if changed or not os.path.isfile(path):
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=4)
+            fh.write("\n")
+        os.replace(tmp, path)
+        print(f"[workflow] Enforced Comfy.TutorialCompleted=true in {path}")
+
+
+def write_default_workflow_file(root: str) -> None:
+    if not os.path.isdir(root):
+        return
+    path = os.path.join(root, "default_workflow.json")
+    content = json.dumps(BLANK_GRAPH, separators=(",", ":")) + "\n"
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as fh:
+            if fh.read() == content:
+                return
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(content)
+    os.replace(tmp, path)
+    print(f"[workflow] Wrote empty default workflow to {path}")
+
+
+def find_frontend_asset_dirs() -> list[str]:
+    dirs: list[str] = []
+    seen: set[str] = set()
+
+    def add_dir(p: str) -> None:
+        ap = os.path.abspath(p)
+        if ap not in seen and os.path.isdir(ap):
+            seen.add(ap)
+            dirs.append(ap)
+
+    try:
+        spec = importlib.util.find_spec("comfyui_frontend_package")
+    except Exception:
+        spec = None
+    if spec:
+        locations = list(spec.submodule_search_locations or [])
+        if not locations and spec.origin:
+            locations = [os.path.dirname(spec.origin)]
+        for loc in locations:
+            add_dir(os.path.join(loc, "static", "assets"))
+
+    for pattern in (
+        "/opt/comfyui-venv/lib/python*/site-packages/comfyui_frontend_package/static/assets",
+        "/workspace/ComfyUI/venv/lib/python*/site-packages/comfyui_frontend_package/static/assets",
+        "/workspace/.venv/lib/python*/site-packages/comfyui_frontend_package/static/assets",
+        "/usr/local/lib/python*/dist-packages/comfyui_frontend_package/static/assets",
+        "/usr/local/lib/python*/site-packages/comfyui_frontend_package/static/assets",
+    ):
+        for match in glob.glob(pattern):
+            add_dir(match)
+
+    return dirs
+
+
+def patch_frontend_assets(asset_dirs: list[str]) -> None:
+    pat = re.compile(
+        r"window\.comfyAPI\.defaultGraph\.defaultGraph\s*=\s*([A-Za-z0-9_$]+)[,;]\s*"
+        r"window\.comfyAPI\.defaultGraph\.defaultGraphJSON\s*=\s*([A-Za-z0-9_$]+)[,;]\s*"
+        r"window\.comfyAPI\.defaultGraph\.blankGraph\s*=\s*([A-Za-z0-9_$]+)"
+    )
+
+    for assets_dir in asset_dirs:
+        candidates = sorted(glob.glob(os.path.join(assets_dir, "workflowStore-*.js")))
+        other_js = sorted(
+            p for p in glob.glob(os.path.join(assets_dir, "*.js"))
+            if p not in candidates
+        )
+        patched_in_dir = False
+        for js_path in candidates + other_js:
+            try:
+                with open(js_path, "r", encoding="utf-8") as fh:
+                    text = fh.read()
+            except Exception:
+                continue
+            if "window.comfyAPI.defaultGraph.defaultGraph" not in text:
+                continue
+            m = pat.search(text)
+            if not m:
+                continue
+            dg_var, json_var, blank_var = m.group(1), m.group(2), m.group(3)
+            prefix_window = text[max(0, m.start() - 160):m.start()]
+            if f"Object.keys({dg_var}).forEach" in prefix_window:
+                patched_in_dir = True
+                break
+            injection = (
+                f"Object.keys({dg_var}).forEach(k=>delete {dg_var}[k]),"
+                f"Object.assign({dg_var},{blank_var}),"
+                f"{json_var}=JSON.stringify({blank_var}),"
+            )
+            new_text = text[:m.start()] + injection + text[m.start():]
+            tmp = f"{js_path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(new_text)
+            os.replace(tmp, js_path)
+            print(f"[workflow] Patched defaultGraph to blankGraph in {js_path}")
+            patched_in_dir = True
+            break
+        if not patched_in_dir:
+            print(f"[workflow][warn] defaultGraph export pattern not found in {assets_dir}")
+
+
+for settings_path in (
+    "/workspace/ComfyUI/user/default/comfy.settings.json",
+    "/Comfy/user/default/comfy.settings.json",
+):
+    try:
+        update_settings_file(settings_path)
+    except Exception as exc:
+        print(f"[workflow][warn] Failed updating {settings_path}: {exc}")
+
+for root_dir in ("/workspace/ComfyUI", "/Comfy"):
+    try:
+        write_default_workflow_file(root_dir)
+    except Exception as exc:
+        print(f"[workflow][warn] Failed writing default_workflow.json in {root_dir}: {exc}")
+
+asset_dirs = find_frontend_asset_dirs()
+if asset_dirs:
+    patch_frontend_assets(asset_dirs)
+else:
+    print("[workflow][warn] comfyui_frontend_package static/assets directory not found")
+PY
+}
+
 launch_comfyui_runtime() {
   local pin_cores=""
   cd /workspace/ComfyUI || return 1
@@ -2982,6 +3167,7 @@ launch_comfyui_runtime() {
     kill "${COMFY_PLACEHOLDER_PID}" 2>/dev/null || true
     sleep 0.5
   fi
+  ensure_empty_default_workflow
   echo "STAGE: Starting ComfyUI"
   local comfy_args=(--listen 0.0.0.0 --port 8188 --enable-cors-header "*" --preview-method taesd)
   if [[ "${NEW_MANAGER:-0}" == "1" ]]; then
