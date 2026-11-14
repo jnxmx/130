@@ -1853,7 +1853,7 @@ if sys_site and sys_site.is_dir():
     )
     pkg_hasher.update("\n".join(names).encode("utf-8"))
 
-print(f"py{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|torch={torch_ver}|constraints={c_hash}|syspkgs={pkg_hasher.hexdigest()[:16]}")
+print(f"schema=v2|py{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|torch={torch_ver}|constraints={c_hash}|syspkgs={pkg_hasher.hexdigest()[:16]}")
 PY
 }
 
@@ -1940,9 +1940,13 @@ if not sys_site:
 copied_dist = 0
 created_dirs = 0
 linked_files = 0
+copied_files = 0
 
-def seed_dir_tree(src_dir: Path, dst_dir: Path) -> None:
-    global created_dirs, linked_files
+COPY_PKG_PREFIXES = ("comfyui", "comfy_", "comfy-")
+STATIC_ASSET_DIRS = {"static", "web", "assets", "templates", "frontend", "html", "docs"}
+
+def seed_dir_tree(src_dir: Path, dst_dir: Path, copy_files: bool = False) -> None:
+    global created_dirs, linked_files, copied_files
     if dst_dir.is_symlink() or dst_dir.is_file():
         dst_dir.unlink(missing_ok=True)
     dst_dir.mkdir(parents=True, exist_ok=True)
@@ -1954,10 +1958,20 @@ def seed_dir_tree(src_dir: Path, dst_dir: Path) -> None:
         if entry.is_dir(follow_symlinks=True):
             # Recursively materialize real dirs at every depth so `uv` uninstalls
             # never hit a symlinked directory (ENOTDIR / os error 20).
-            seed_dir_tree(Path(entry.path), dst_entry)
+            seed_dir_tree(
+                Path(entry.path),
+                dst_entry,
+                copy_files=copy_files or (entry.name.lower() in STATIC_ASSET_DIRS),
+            )
         elif not dst_entry.exists() and not dst_entry.is_symlink():
-            os.symlink(entry.path, dst_entry)
-            linked_files += 1
+            if copy_files and os.path.exists(entry.path):
+                # Materialize real files for static/web packages so aiohttp's
+                # `web.static(..., follow_symlinks=False)` serves them cleanly.
+                shutil.copy2(entry.path, dst_entry)
+                copied_files += 1
+            else:
+                os.symlink(entry.path, dst_entry)
+                linked_files += 1
 
 for src in sys_site.iterdir():
     name = src.name
@@ -1976,7 +1990,8 @@ for src in sys_site.iterdir():
             shutil.copy2(src, dst)
         copied_dist += 1
     elif src.is_dir():
-        seed_dir_tree(src, dst)
+        should_copy = name.lower().startswith(COPY_PKG_PREFIXES) or (name.lower() in STATIC_ASSET_DIRS)
+        seed_dir_tree(src, dst, copy_files=should_copy)
     else:
         if not dst.exists() and not dst.is_symlink():
             os.symlink(str(src), str(dst))
@@ -1984,8 +1999,65 @@ for src in sys_site.iterdir():
 
 print(
     f"[venv] seeded isolated venv from {sys_site}: "
-    f"copied_dist={copied_dist}, dirs={created_dirs}, file_links={linked_files}"
+    f"copied_dist={copied_dist}, dirs={created_dirs}, file_links={linked_files}, copied_files={copied_files}"
 )
+PY
+}
+
+materialize_comfy_venv_web_assets() {
+  local venv_dir="${1:-$VIRTUAL_ENV}"
+  local sys_py
+  sys_py="$(comfy_venv_system_python)"
+  "$sys_py" - "$venv_dir" <<'PY'
+import os
+import shutil
+import sys
+from pathlib import Path
+
+venv_dir = Path(sys.argv[1])
+target_site = next((d for d in sorted(venv_dir.glob("lib/python*/site-packages")) if d.is_dir()), None)
+if not target_site:
+    raise SystemExit(0)
+
+materialized = 0
+for root_entry in sorted(target_site.glob("comfy*")):
+    if root_entry.name.endswith((".dist-info", ".egg-info")):
+        continue
+    if root_entry.is_symlink():
+        target = root_entry.resolve()
+        if target.is_dir():
+            root_entry.unlink()
+            shutil.copytree(target, root_entry)
+            materialized += 1
+        elif target.is_file():
+            root_entry.unlink()
+            shutil.copy2(target, root_entry)
+            materialized += 1
+        continue
+    if not root_entry.is_dir():
+        continue
+    for dirpath, dirnames, filenames in os.walk(root_entry, followlinks=False):
+        dp = Path(dirpath)
+        for dname in list(dirnames):
+            dpath = dp / dname
+            if dpath.is_symlink():
+                target = dpath.resolve()
+                if target.is_dir():
+                    dpath.unlink()
+                    shutil.copytree(target, dpath)
+                    materialized += 1
+                    dirnames.remove(dname)
+        for fname in filenames:
+            fpath = dp / fname
+            if fpath.is_symlink():
+                target = fpath.resolve()
+                if target.is_file():
+                    fpath.unlink()
+                    shutil.copy2(target, fpath)
+                    materialized += 1
+
+if materialized:
+    print(f"[venv] Materialized {materialized} symlinked comfy web/package asset(s) as real files.")
 PY
 }
 
@@ -1998,6 +2070,7 @@ ensure_comfy_venv_ready() {
   expected_stamp="$(comfy_venv_base_stamp)"
 
   if is_comfy_venv_healthy "$venv_dir"; then
+    materialize_comfy_venv_web_assets "$venv_dir"
     return 0
   fi
 
@@ -2010,6 +2083,7 @@ ensure_comfy_venv_ready() {
       mkdir -p "$venv_dir"
       if command -v lz4 >/dev/null 2>&1 && lz4 -dc "$archive" | tar -xf - -C "$venv_dir"; then
         if is_comfy_venv_healthy "$venv_dir"; then
+          materialize_comfy_venv_web_assets "$venv_dir"
           comfy_venv_dist_fingerprint "$venv_dir" > "$COMFY_VENV_SAVED_FP_FILE" 2>/dev/null || true
           echo "[venv] Restored persisted venv successfully."
           return 0
