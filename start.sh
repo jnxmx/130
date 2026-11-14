@@ -2708,7 +2708,7 @@ apply_runtime_comfy_settings() {
          | del(."Comfy.Workflow.Default", ."Comfy.Workspace.WorkflowOnLoad")
          | ."loramanager.usage_statistics" = false
          | ."Comfy.Execution.PreviewMethod" = "taesd"
-         | ."VHS.LatentPreview" = true
+         | ."VHS.LatentPreview" = false
          | ."Crystools.MonitorHeight" = 16
          | (if $repo != "" then ."downloaderbackup.repo_name" = $repo else . end)
          | (if $disable_timer == 1 then ."runpod.enable_shutdown_timer" = false else . end)' \
@@ -3169,7 +3169,7 @@ launch_comfyui_runtime() {
   fi
   ensure_empty_default_workflow
   echo "STAGE: Starting ComfyUI"
-  local comfy_args=(--listen 0.0.0.0 --port 8188 --enable-cors-header "*" --preview-method taesd)
+  local comfy_args=(--listen 0.0.0.0 --port 8188 --enable-cors-header "*")
   if [[ "${NEW_MANAGER:-0}" == "1" ]]; then
     comfy_args+=(--enable-manager)
   fi

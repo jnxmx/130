@@ -4,7 +4,7 @@
     "KJNodes.nodeAutoColor": false,
     "Comfy.WidgetControlMode": "before",
     "Crystools.ShowHdd": true,
-    "VHS.LatentPreview": true,
+    "VHS.LatentPreview": false,
     "Comfy.Locale": "en",
     "Comfy.ColorPalette": "nord",
     "pysssss.ImageFeed.Location": "hidden",
