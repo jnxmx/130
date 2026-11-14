@@ -30,6 +30,7 @@
     "Crystools.WhichHdd": "/workspace",
     "Crystools.ShowGpuTemperatureZero": false,
     "Crystools.ProgressBar": false,
+    "Crystools.MonitorHeight": 16,
     "Comfy.Sidebar.Style": "floating",
     "Comfy.Sidebar.Location": "left",
     "Comfy.Sidebar.Size": "normal",

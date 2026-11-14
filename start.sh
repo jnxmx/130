@@ -2630,6 +2630,7 @@ apply_runtime_comfy_settings() {
         '."loramanager.usage_statistics" = false
          | ."Comfy.Execution.PreviewMethod" = "taesd"
          | ."VHS.LatentPreview" = true
+         | ."Crystools.MonitorHeight" = 16
          | (if $repo != "" then ."downloaderbackup.repo_name" = $repo else . end)
          | (if $disable_timer == 1 then ."runpod.enable_shutdown_timer" = false else . end)' \
         "$settings" > "$tmp" && mv "$tmp" "$settings"; then
@@ -2837,12 +2838,61 @@ PY
   sleep 1
 }
 
+configure_cpu_thread_limits() {
+  local host_cpus cg_cpus="" quota="" period="" effective_cpus max_threads
+  host_cpus="$(nproc 2>/dev/null || echo 8)"
+  if [[ ! "$host_cpus" =~ ^[0-9]+$ ]] || (( host_cpus < 1 )); then
+    host_cpus=8
+  fi
+
+  if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+    read -r quota period < /sys/fs/cgroup/cpu.max || true
+    if [[ "$quota" =~ ^[0-9]+$ && "$period" =~ ^[0-9]+$ ]] && (( quota > 0 && period > 0 )); then
+      cg_cpus=$(( quota / period ))
+      (( cg_cpus < 1 )) && cg_cpus=1
+    fi
+  elif [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
+    read -r quota < /sys/fs/cgroup/cpu/cpu.cfs_quota_us || true
+    read -r period < /sys/fs/cgroup/cpu/cpu.cfs_period_us || true
+    if [[ "$quota" =~ ^[0-9]+$ && "$period" =~ ^[0-9]+$ ]] && (( quota > 0 && period > 0 )); then
+      cg_cpus=$(( quota / period ))
+      (( cg_cpus < 1 )) && cg_cpus=1
+    fi
+  fi
+
+  if [[ -z "$cg_cpus" && "${RUNPOD_CPU_COUNT:-}" =~ ^[0-9]+$ ]] && (( RUNPOD_CPU_COUNT > 0 )); then
+    cg_cpus="$RUNPOD_CPU_COUNT"
+  fi
+
+  effective_cpus="$host_cpus"
+  if [[ -n "$cg_cpus" ]] && (( cg_cpus < effective_cpus )); then
+    effective_cpus="$cg_cpus"
+  fi
+
+  max_threads="${MAX_OMP_THREADS:-16}"
+  if [[ "$max_threads" =~ ^[0-9]+$ ]] && (( max_threads > 0 && effective_cpus > max_threads )); then
+    effective_cpus="$max_threads"
+  fi
+  (( effective_cpus < 1 )) && effective_cpus=1
+
+  export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$effective_cpus}"
+  export MKL_NUM_THREADS="${MKL_NUM_THREADS:-$OMP_NUM_THREADS}"
+  export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-$OMP_NUM_THREADS}"
+  export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-$OMP_NUM_THREADS}"
+  export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-$OMP_NUM_THREADS}"
+  export TORCH_NUM_THREADS="${TORCH_NUM_THREADS:-$OMP_NUM_THREADS}"
+  export OMP_WAIT_POLICY="${OMP_WAIT_POLICY:-PASSIVE}"
+  export KMP_BLOCKTIME="${KMP_BLOCKTIME:-0}"
+  echo "[cpu] Thread pool configured: OMP_NUM_THREADS=${OMP_NUM_THREADS} OMP_WAIT_POLICY=${OMP_WAIT_POLICY} KMP_BLOCKTIME=${KMP_BLOCKTIME} (host_nproc=${host_cpus}, cgroup_cpus=${cg_cpus:-none})"
+}
+
 launch_comfyui_runtime() {
   local pin_cores=""
   cd /workspace/ComfyUI || return 1
   # Ensure ComfyUI allows all hosts and origins for proxy compatibility
   export COMFYUI_ALLOWED_HOSTS="*"
   export COMFYUI_CORS_ALLOWED_ORIGINS="*"
+  configure_cpu_thread_limits
   if [[ "${CPU_CONFIRM_REQUIRED:-0}" == "1" && ! -f "${CPU_CONTINUE_FILE:-/tmp/continue_cpu}" ]]; then
     echo "STAGE: Waiting for CPU confirmation"
     echo "[cpu] Waiting for user confirmation on :${CPU_WAIT_PORT:-8188} before launching ComfyUI..."
@@ -2886,6 +2936,59 @@ launch_comfyui_runtime() {
   fi
   if [[ -n "${RESERVE_VRAM:-}" ]]; then
     comfy_args+=(--reserve-vram "$RESERVE_VRAM")
+  fi
+  if [[ -n "${CACHE_RAM:-}" ]]; then
+    local cache_ram_lc
+    cache_ram_lc="$(printf '%s' "$CACHE_RAM" | tr '[:upper:]' '[:lower:]')"
+    case "$cache_ram_lc" in
+      0|off|false|none)
+        echo "[ram] CACHE_RAM=${CACHE_RAM} set; skipping automatic --cache-ram configuration"
+        ;;
+      *)
+        local cache_ram_vals=()
+        read -r -a cache_ram_vals <<< "$CACHE_RAM" || true
+        if (( ${#cache_ram_vals[@]} > 0 )); then
+          echo "[ram] CACHE_RAM=${CACHE_RAM} set; appending --cache-ram ${cache_ram_vals[*]}"
+          comfy_args+=(--cache-ram "${cache_ram_vals[@]}")
+        fi
+        ;;
+    esac
+  else
+    local host_mem_bytes=0 cg_mem="" effective_ram_bytes=0 effective_ram_gib=0
+    if [[ -r /proc/meminfo ]]; then
+      host_mem_bytes="$(awk '/^MemTotal:/ {printf "%.0f\n", $2 * 1024; exit}' /proc/meminfo 2>/dev/null || echo 0)"
+      [[ "$host_mem_bytes" =~ ^[0-9]+$ ]] || host_mem_bytes=0
+    fi
+    if [[ -r /sys/fs/cgroup/memory.max ]]; then
+      cg_mem="$(tr -d '[:space:]' < /sys/fs/cgroup/memory.max 2>/dev/null || true)"
+    elif [[ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+      cg_mem="$(tr -d '[:space:]' < /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || true)"
+    fi
+    effective_ram_bytes="$host_mem_bytes"
+    if [[ "$cg_mem" =~ ^[0-9]+$ ]] && (( cg_mem > 0 && cg_mem < 1152921504606846976 )); then
+      if (( effective_ram_bytes == 0 || cg_mem < effective_ram_bytes )); then
+        effective_ram_bytes="$cg_mem"
+      fi
+    fi
+    if (( effective_ram_bytes > 0 )); then
+      effective_ram_gib=$(( (effective_ram_bytes + 536870912) / 1073741824 ))
+      if (( effective_ram_gib > 0 && effective_ram_gib <= 62 )); then
+        local active_headroom=8
+        if (( effective_ram_gib < 32 )); then
+          active_headroom=6
+        fi
+        local inactive_pin=$(( effective_ram_gib / 2 ))
+        (( inactive_pin < 16 )) && inactive_pin=16
+        (( inactive_pin > 30 )) && inactive_pin=30
+        if grep -qE -- '--cache-ram.*nargs=.*\*' /workspace/ComfyUI/comfy/cli_args.py 2>/dev/null; then
+          echo "[ram] Low-RAM container detected (${effective_ram_gib} GiB); setting --cache-ram ${active_headroom} ${inactive_pin}"
+          comfy_args+=(--cache-ram "$active_headroom" "$inactive_pin")
+        else
+          echo "[ram] Low-RAM container detected (${effective_ram_gib} GiB); setting --cache-ram ${active_headroom}"
+          comfy_args+=(--cache-ram "$active_headroom")
+        fi
+      fi
+    fi
   fi
   if [[ -n "$pin_cores" ]] && command -v taskset >/dev/null 2>&1; then
     if taskset -c "$pin_cores" true >/dev/null 2>&1; then
@@ -2931,6 +3034,7 @@ export -f stop_placeholder_process
 export -f pip_install
 export -f pip_install_requirements
 export -f prepare_fizgig_runtime
+export -f configure_cpu_thread_limits
 export -f launch_comfyui_runtime
 export -f launch_fizgig_runtime
 export -f comfy_venv_system_python
@@ -2949,6 +3053,9 @@ export CPU_PIN_CANDIDATE
 export VIRTUAL_ENV
 export NEW_MANAGER
 export DISABLE_PM
+export DISABLE_CUDA_MALLOC
+export RESERVE_VRAM
+export CACHE_RAM
 export FIZGIG_DIR
 export FIZGIG_REPO_URL
 export FIZGIG_REPO_REF
