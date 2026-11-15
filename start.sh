@@ -3218,7 +3218,7 @@ launch_comfyui_runtime() {
     cache_ram_lc="$(printf '%s' "$CACHE_RAM" | tr '[:upper:]' '[:lower:]')"
     case "$cache_ram_lc" in
       0|off|false|none)
-        echo "[ram] CACHE_RAM=${CACHE_RAM} set; skipping automatic --cache-ram configuration"
+        echo "[ram] CACHE_RAM=${CACHE_RAM} set; using ComfyUI default --cache-ram"
         ;;
       *)
         local cache_ram_vals=()
@@ -3229,42 +3229,6 @@ launch_comfyui_runtime() {
         fi
         ;;
     esac
-  else
-    local host_mem_bytes=0 cg_mem="" effective_ram_bytes=0 effective_ram_gib=0
-    if [[ -r /proc/meminfo ]]; then
-      host_mem_bytes="$(awk '/^MemTotal:/ {printf "%.0f\n", $2 * 1024; exit}' /proc/meminfo 2>/dev/null || echo 0)"
-      [[ "$host_mem_bytes" =~ ^[0-9]+$ ]] || host_mem_bytes=0
-    fi
-    if [[ -r /sys/fs/cgroup/memory.max ]]; then
-      cg_mem="$(tr -d '[:space:]' < /sys/fs/cgroup/memory.max 2>/dev/null || true)"
-    elif [[ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
-      cg_mem="$(tr -d '[:space:]' < /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || true)"
-    fi
-    effective_ram_bytes="$host_mem_bytes"
-    if [[ "$cg_mem" =~ ^[0-9]+$ ]] && (( cg_mem > 0 && cg_mem < 1152921504606846976 )); then
-      if (( effective_ram_bytes == 0 || cg_mem < effective_ram_bytes )); then
-        effective_ram_bytes="$cg_mem"
-      fi
-    fi
-    if (( effective_ram_bytes > 0 )); then
-      effective_ram_gib=$(( (effective_ram_bytes + 536870912) / 1073741824 ))
-      if (( effective_ram_gib > 0 && effective_ram_gib <= 62 )); then
-        local active_headroom=8
-        if (( effective_ram_gib < 32 )); then
-          active_headroom=6
-        fi
-        local inactive_pin=$(( effective_ram_gib / 2 ))
-        (( inactive_pin < 16 )) && inactive_pin=16
-        (( inactive_pin > 30 )) && inactive_pin=30
-        if grep -qE -- '--cache-ram.*nargs=.*\*' /workspace/ComfyUI/comfy/cli_args.py 2>/dev/null; then
-          echo "[ram] Low-RAM container detected (${effective_ram_gib} GiB); setting --cache-ram ${active_headroom} ${inactive_pin}"
-          comfy_args+=(--cache-ram "$active_headroom" "$inactive_pin")
-        else
-          echo "[ram] Low-RAM container detected (${effective_ram_gib} GiB); setting --cache-ram ${active_headroom}"
-          comfy_args+=(--cache-ram "$active_headroom")
-        fi
-      fi
-    fi
   fi
   if [[ -n "$pin_cores" ]] && command -v taskset >/dev/null 2>&1; then
     if taskset -c "$pin_cores" true >/dev/null 2>&1; then
