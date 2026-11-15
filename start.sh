@@ -428,6 +428,7 @@ result = {
     "status": "volume_disk",
     "mounted": False,
     "global_volume": False,
+    "xfs": False,
     "mountpoint": "/workspace",
     "source": None,
     "fstype": None,
@@ -442,10 +443,13 @@ if skip:
     print(json.dumps(result, ensure_ascii=False))
     raise SystemExit(0)
 
-if forced in {"no_volume", "global_volume", "volume_disk"}:
-    result["status"] = forced
+if forced in {"no_volume", "global_volume", "volume_disk", "xfs"}:
+    result["status"] = "volume_disk" if forced == "xfs" else forced
     result["mounted"] = forced != "no_volume"
     result["global_volume"] = forced == "global_volume"
+    if forced == "xfs":
+        result["fstype"] = "xfs"
+        result["xfs"] = True
     result["reason"] = f"FORCE_VOLUME_STATE={forced}"
     print(json.dumps(result, ensure_ascii=False))
     raise SystemExit(2 if forced == "no_volume" else 0)
@@ -506,6 +510,7 @@ for env_key, env_val in os.environ.items():
 
 src_l = (result["source"] or "").lower()
 fs_l = (result["fstype"] or "").lower()
+result["xfs"] = (fs_l == "xfs")
 opts_l = (result["options"] or "").lower()
 combined_sig = f"{src_l} {fs_l} {opts_l}"
 
@@ -907,6 +912,13 @@ EOF
   echo "[warn][global_volume_agent] AGENT DEPLOYMENT WARNING: A RunPod Global Volume is utilized in place of a Pod Volume Disk. Do NOT stop deployment, but warn the user during deploy that Global Volumes are not deleted when the pod is terminated and RunPod will charge \$0.10/GB/month (10c/GB) if they do not delete the Global Volume afterward."
   echo "[warn][global_volume_diag] ${VOLUME_DIAG}"
 fi
+
+WORKSPACE_XFS=0
+if [[ "$VOLUME_DIAG" == *'"xfs": true'* ]] || [[ "$VOLUME_DIAG" == *'"fstype": "xfs"'* ]] || [[ "$(findmnt -n -o FSTYPE /workspace 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)" == "xfs" ]]; then
+  WORKSPACE_XFS=1
+  echo "[volume] /workspace drive is xfs (fast local NVMe volume disk detected); --fast-disk will be enabled for ComfyUI."
+fi
+export WORKSPACE_XFS
 
 # --- CPU preflight (warn + confirm on overload) ---
 if check_cpu_overload; then
@@ -3176,6 +3188,10 @@ launch_comfyui_runtime() {
   if [[ "${DISABLE_PM:-0}" == "1" ]]; then
     comfy_args+=(--disable-pinned-memory)
   fi
+  if [[ "${WORKSPACE_XFS:-0}" == "1" ]] || [[ "$(findmnt -n -o FSTYPE /workspace 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)" == "xfs" ]]; then
+    echo "[volume] /workspace drive is xfs; adding --fast-disk startup flag"
+    comfy_args+=(--fast-disk)
+  fi
   if [[ "${DISABLE_CUDA_MALLOC:-0}" == "1" ]]; then
     echo "[gpu] DISABLE_CUDA_MALLOC=1 set; appending --disable-cuda-malloc"
     comfy_args+=(--disable-cuda-malloc)
@@ -3313,6 +3329,7 @@ export CPU_PIN_CANDIDATE
 export VIRTUAL_ENV
 export NEW_MANAGER
 export DISABLE_PM
+export WORKSPACE_XFS
 export DISABLE_CUDA_MALLOC
 export RESERVE_VRAM
 export CACHE_RAM
