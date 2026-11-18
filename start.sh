@@ -2688,12 +2688,12 @@ if [[ "${MAKE_WHEELS:-0}" == "1" ]]; then
   else
     echo "[deps] Ensuring build toolchain (build-essential, python3-dev, CUDA headers) is installed..."
     apt-get update -qq && (apt-get install -y --no-install-recommends build-essential python3-dev libcublas-dev libcusparse-dev -qq || apt-get install -y --no-install-recommends build-essential python3-dev -qq) 2>/dev/null || true
-    mkdir -p "$SAGE_WHEEL_OUTPUT_DIR"
+    mkdir -p "$SAGE_WHEEL_OUTPUT_DIR" || true
     TMP_SAGE_BUILD_DIR=$(mktemp -d /tmp/sageattention-src.XXXXXX)
     TMP_SAGE_WHEEL_DIR=$(mktemp -d /tmp/sageattention-out.XXXXXX)
     if _sage_fetch_source "$TMP_SAGE_BUILD_DIR"; then
       echo "Building sageattention wheel for $ARCH in $TMP_SAGE_WHEEL_DIR..."
-      _sage_patch_and_build_env "$TMP_SAGE_BUILD_DIR" "$ARCH"
+      _sage_patch_and_build_env "$TMP_SAGE_BUILD_DIR" "$ARCH" || true
 
       if "$VIRTUAL_ENV/bin/python" -m pip wheel --no-deps --no-build-isolation --no-cache-dir "$TMP_SAGE_BUILD_DIR" -w "$TMP_SAGE_WHEEL_DIR"; then
         BUILT_WHEEL=$(find "$TMP_SAGE_WHEEL_DIR" -maxdepth 1 -type f -name "sageattention-*.whl" -print -quit 2>/dev/null || true)
@@ -2702,21 +2702,25 @@ if [[ "${MAKE_WHEELS:-0}" == "1" ]]; then
           VER_STR=$(echo "$BASE_NAME" | sed -E 's/^sageattention-([^-]+)-.*/\1/' || true)
           RENAMED_NAME="${BASE_NAME/sageattention-${VER_STR}-/sageattention-${VER_STR}+${ARCH}-}"
           TARGET_PATH="${SAGE_WHEEL_OUTPUT_DIR}/${RENAMED_NAME}"
-          mv "$BUILT_WHEEL" "$TARGET_PATH"
-          echo "Saved architecture-specific wheel to $TARGET_PATH"
-          echo "Installing sageattention from built wheel"
-          pip_install "$VIRTUAL_ENV/bin/python" --no-deps "$TARGET_PATH"
+          if mv "$BUILT_WHEEL" "$TARGET_PATH"; then
+            echo "Saved architecture-specific wheel to $TARGET_PATH"
+            echo "Installing sageattention from built wheel"
+            pip_install "$VIRTUAL_ENV/bin/python" --no-deps "$TARGET_PATH" || echo "[sage][warn] Failed to install built sageattention wheel; skipping (optional in modern ComfyUI)."
+          else
+            echo "[sage][warn] Failed to move built wheel to $TARGET_PATH; installing from $BUILT_WHEEL"
+            pip_install "$VIRTUAL_ENV/bin/python" --no-deps "$BUILT_WHEEL" || echo "[sage][warn] Failed to install built sageattention wheel; skipping (optional in modern ComfyUI)."
+          fi
         else
           echo "[WARN] Wheel build succeeded but artifact missing; installing from source directly"
-          pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_SAGE_BUILD_DIR"
+          pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_SAGE_BUILD_DIR" || echo "[sage][warn] Failed to install sageattention from source; skipping (optional in modern ComfyUI)."
         fi
       else
-        echo "[WARN] Failed to build sageattention wheel; installing from source directly"
-        pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_SAGE_BUILD_DIR"
+        echo "[WARN] Failed to build sageattention wheel; trying source install directly"
+        pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_SAGE_BUILD_DIR" || echo "[sage][warn] Failed to install sageattention from source; skipping (optional in modern ComfyUI)."
       fi
       unset MAX_JOBS NINJA_MAX_JOBS EXT_PARALLEL NVCC_APPEND_FLAGS TORCH_CUDA_ARCH_LIST CUDA_HOME 2>/dev/null || true
     else
-      echo "[WARN] Failed to download SageAttention source archive"
+      echo "[WARN] Failed to download SageAttention source archive; skipping (optional in modern ComfyUI)."
     fi
     rm -rf "${TMP_SAGE_BUILD_DIR:-}" "${TMP_SAGE_WHEEL_DIR:-}"
   fi
@@ -2726,7 +2730,7 @@ else
       WHEEL_FILE=$(find /wheels /workspace/wheels -type f -name "sageattention-*+${ARCH}-*.whl" 2>/dev/null | head -n 1 || true)
       if [ -n "$WHEEL_FILE" ]; then
           echo "Installing sageattention wheel for architecture $ARCH"
-          pip_install "$VIRTUAL_ENV/bin/python" --no-deps "$WHEEL_FILE"
+          pip_install "$VIRTUAL_ENV/bin/python" --no-deps "$WHEEL_FILE" || echo "[sage][warn] Failed to install sageattention wheel ($WHEEL_FILE); skipping (optional in modern ComfyUI)."
       else
           echo "No matching wheel found for architecture $ARCH, downloading and installing from source"
           if ! dpkg -s libcusparse-dev >/dev/null 2>&1; then
@@ -2735,11 +2739,13 @@ else
           fi
           TMP_CLONE_DIR=$(mktemp -d /tmp/sage-dl.XXXXXX)
           if _sage_fetch_source "$TMP_CLONE_DIR"; then
-            _sage_patch_and_build_env "$TMP_CLONE_DIR" "$ARCH"
-            pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_CLONE_DIR"
+            _sage_patch_and_build_env "$TMP_CLONE_DIR" "$ARCH" || true
+            pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_CLONE_DIR" || echo "[sage][warn] Failed to build/install sageattention from source for $ARCH; skipping (optional in modern ComfyUI)."
             unset MAX_JOBS NINJA_MAX_JOBS EXT_PARALLEL NVCC_APPEND_FLAGS TORCH_CUDA_ARCH_LIST CUDA_HOME 2>/dev/null || true
+          else
+            echo "[sage][warn] Failed to download SageAttention source; skipping (optional in modern ComfyUI)."
           fi
-          rm -rf "$TMP_CLONE_DIR"
+          rm -rf "${TMP_CLONE_DIR:-}"
       fi
   else
       echo "STAGE: Installing sageattention"
@@ -2750,11 +2756,13 @@ else
       fi
       TMP_CLONE_DIR=$(mktemp -d /tmp/sage-dl.XXXXXX)
       if _sage_fetch_source "$TMP_CLONE_DIR"; then
-        _sage_patch_and_build_env "$TMP_CLONE_DIR" "none"
-        pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_CLONE_DIR"
+        _sage_patch_and_build_env "$TMP_CLONE_DIR" "none" || true
+        pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_CLONE_DIR" || echo "[sage][warn] Failed to build/install sageattention from source; skipping (optional in modern ComfyUI)."
         unset MAX_JOBS NINJA_MAX_JOBS EXT_PARALLEL NVCC_APPEND_FLAGS TORCH_CUDA_ARCH_LIST CUDA_HOME 2>/dev/null || true
+      else
+        echo "[sage][warn] Failed to download SageAttention source; skipping (optional in modern ComfyUI)."
       fi
-      rm -rf "$TMP_CLONE_DIR"
+      rm -rf "${TMP_CLONE_DIR:-}"
   fi
 fi
 
