@@ -410,6 +410,213 @@ raise SystemExit(0 if result["ok"] else 1)
 PY
 }
 
+# --- Host GPU overload preflight helper (non-blocking warning; always exits 0) ---
+gpu_overload_probe_json() {
+  python3 - <<'PY'
+import json
+import os
+import subprocess
+import time
+
+def _is_truthy(val) -> bool:
+    return str(val or "").strip().lower() in {"1", "true", "yes", "on"}
+
+def _parse_float(raw):
+    text = str(raw or "").strip()
+    if not text or text.upper() in {"N/A", "[N/A]", "NOT SUPPORTED", "[NOT SUPPORTED]"}:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+def _parse_int(raw):
+    val = _parse_float(raw)
+    return int(round(val)) if val is not None else None
+
+result = {
+    "status": "ok",
+    "overloaded": False,
+    "gpu_index": 0,
+    "gpu_name": None,
+    "gpu_util_avg": 0,
+    "gpu_util_min": 0,
+    "gpu_util_max": 0,
+    "mem_util_avg": 0,
+    "memory_used_mib": 0,
+    "memory_total_mib": 0,
+    "container_vram_mib": 0,
+    "external_vram_mib": 0,
+    "container_sm_util": 0,
+    "power_draw_w": None,
+    "power_limit_w": None,
+    "temp_c": None,
+    "pstate": None,
+    "reason": None,
+}
+
+if _is_truthy(os.environ.get("SKIP_GPU_OVERLOAD_CHECK")):
+    result["reason"] = "SKIP_GPU_OVERLOAD_CHECK enabled"
+    print(json.dumps(result, ensure_ascii=False))
+    raise SystemExit(0)
+
+if _is_truthy(os.environ.get("FORCE_GPU_OVERLOAD")):
+    result.update({
+        "status": "gpu_overload",
+        "overloaded": True,
+        "gpu_name": "NVIDIA GeForce RTX 5090",
+        "gpu_util_avg": 100,
+        "gpu_util_min": 100,
+        "gpu_util_max": 100,
+        "mem_util_avg": 0,
+        "memory_used_mib": 1548,
+        "memory_total_mib": 32607,
+        "container_vram_mib": 0,
+        "external_vram_mib": 1548,
+        "container_sm_util": 0,
+        "power_draw_w": 400.0,
+        "power_limit_w": 400.0,
+        "temp_c": 63,
+        "pstate": "P1",
+        "reason": "FORCE_GPU_OVERLOAD enabled",
+    })
+    print(json.dumps(result, ensure_ascii=False))
+    raise SystemExit(0)
+
+samples = []
+query_fields = (
+    "index,name,utilization.gpu,utilization.memory,"
+    "memory.used,memory.total,power.draw,power.limit,temperature.gpu,pstate"
+)
+for sample_idx in range(3):
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", f"--query-gpu={query_fields}", "--format=csv,noheader,nounits"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=4,
+        )
+        rows = [line.strip() for line in out.splitlines() if line.strip()]
+        if rows:
+            parts = [p.strip() for p in rows[0].split(",")]
+            if len(parts) >= 10:
+                samples.append({
+                    "index": _parse_int(parts[0]) or 0,
+                    "name": parts[1] or None,
+                    "gpu_util": _parse_int(parts[2]),
+                    "mem_util": _parse_int(parts[3]),
+                    "mem_used": _parse_int(parts[4]),
+                    "mem_total": _parse_int(parts[5]),
+                    "power_draw": _parse_float(parts[6]),
+                    "power_limit": _parse_float(parts[7]),
+                    "temp": _parse_int(parts[8]),
+                    "pstate": parts[9] or None,
+                })
+    except Exception as exc:
+        if not result["reason"]:
+            result["reason"] = f"nvidia-smi query error: {exc}"
+    if sample_idx < 2:
+        time.sleep(0.4)
+
+if not samples:
+    if not result["reason"]:
+        result["reason"] = "nvidia-smi returned no GPU samples"
+    print(json.dumps(result, ensure_ascii=False))
+    raise SystemExit(0)
+
+gpu_utils = [s["gpu_util"] for s in samples if s["gpu_util"] is not None]
+mem_utils = [s["mem_util"] for s in samples if s["mem_util"] is not None]
+mem_useds = [s["mem_used"] for s in samples if s["mem_used"] is not None]
+mem_totals = [s["mem_total"] for s in samples if s["mem_total"] is not None]
+power_draws = [s["power_draw"] for s in samples if s["power_draw"] is not None]
+power_limits = [s["power_limit"] for s in samples if s["power_limit"] is not None]
+temps = [s["temp"] for s in samples if s["temp"] is not None]
+
+last = samples[-1]
+result["gpu_index"] = last["index"]
+result["gpu_name"] = last["name"]
+result["pstate"] = last["pstate"]
+if gpu_utils:
+    result["gpu_util_avg"] = int(round(sum(gpu_utils) / len(gpu_utils)))
+    result["gpu_util_min"] = min(gpu_utils)
+    result["gpu_util_max"] = max(gpu_utils)
+if mem_utils:
+    result["mem_util_avg"] = int(round(sum(mem_utils) / len(mem_utils)))
+if mem_useds:
+    result["memory_used_mib"] = max(mem_useds)
+if mem_totals:
+    result["memory_total_mib"] = max(mem_totals)
+if power_draws:
+    result["power_draw_w"] = round(sum(power_draws) / len(power_draws), 1)
+if power_limits:
+    result["power_limit_w"] = round(power_limits[-1], 1)
+if temps:
+    result["temp_c"] = max(temps)
+
+container_vram = 0
+try:
+    apps_out = subprocess.check_output(
+        ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=4,
+    )
+    for line in apps_out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+        pid = _parse_int(parts[0])
+        vram = _parse_int(parts[1]) or 0
+        if pid and os.path.exists(f"/proc/{pid}"):
+            container_vram += vram
+except Exception:
+    pass
+
+result["container_vram_mib"] = container_vram
+result["external_vram_mib"] = max(0, result["memory_used_mib"] - container_vram)
+
+container_sm = 0
+try:
+    pmon_out = subprocess.check_output(
+        ["nvidia-smi", "pmon", "-c", "1"],
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=4,
+    )
+    for line in pmon_out.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        cols = stripped.split()
+        if len(cols) >= 4:
+            pid = _parse_int(cols[1])
+            sm = _parse_int(cols[3])
+            if pid and sm is not None and os.path.exists(f"/proc/{pid}"):
+                container_sm += sm
+except Exception:
+    pass
+
+result["container_sm_util"] = container_sm
+
+reasons = []
+if container_sm == 0:
+    if result["gpu_util_avg"] >= 50 or result["gpu_util_min"] >= 35:
+        reasons.append(f"external GPU utilization avg={result['gpu_util_avg']}% (min={result['gpu_util_min']}%)")
+    if result["external_vram_mib"] >= 2048:
+        reasons.append(f"external host process occupies {result['external_vram_mib']} MiB VRAM")
+
+if reasons:
+    result["status"] = "gpu_overload"
+    result["overloaded"] = True
+    result["reason"] = "; ".join(reasons)
+else:
+    result["reason"] = "GPU load within normal startup bounds"
+
+print(json.dumps(result, ensure_ascii=False))
+raise SystemExit(0)
+PY
+}
+
 # --- Workspace volume preflight helper ---
 # Returns JSON with status:
 #   - "no_volume"     (exit 2): /workspace is not mounted (sits on root container overlay /)
@@ -862,6 +1069,73 @@ EOF
   start_comfy_placeholder || true
   ensure_nginx_started || true
   keep_comfy_wait_stack_alive_forever
+fi
+
+# --- Host GPU overload preflight (non-blocking warning; pod deploys normally) ---
+echo "STAGE: Checking GPU load"
+GPU_OVERLOAD_DIAG="$(gpu_overload_probe_json 2>&1 || true)"
+echo "[gpu] load probe result: ${GPU_OVERLOAD_DIAG}"
+
+if [[ "$GPU_OVERLOAD_DIAG" == *'"status": "gpu_overload"'* ]] || [[ "$GPU_OVERLOAD_DIAG" == *'"overloaded": true'* ]]; then
+  GPU_UTIL_SUMMARY="100"
+  GPU_POWER_SUMMARY="unknown power"
+  GPU_VRAM_SUMMARY="0 MiB"
+  GPU_NAME_SUMMARY="GPU"
+  if parsed_gpu_summary="$(GPU_OVERLOAD_JSON="$GPU_OVERLOAD_DIAG" python3 - <<'PY' 2>/dev/null
+import json, os
+try:
+    d = json.loads(os.environ.get("GPU_OVERLOAD_JSON", "{}"))
+except Exception:
+    raise SystemExit(1)
+util = d.get("gpu_util_avg")
+util_str = str(util) if util is not None else "?"
+p_draw = d.get("power_draw_w")
+p_lim = d.get("power_limit_w")
+if p_draw is not None and p_lim is not None:
+    power_str = f"{int(round(p_draw))}W/{int(round(p_lim))}W"
+elif p_draw is not None:
+    power_str = f"{int(round(p_draw))}W"
+else:
+    power_str = "n/a"
+ext_vram = d.get("external_vram_mib")
+vram_str = f"{ext_vram} MiB" if ext_vram is not None else "n/a"
+name_str = str(d.get("gpu_name") or "GPU").replace("\t", " ").replace("\n", " ")
+print(f"{util_str}\t{power_str}\t{vram_str}\t{name_str}")
+PY
+  )"; then
+    IFS=$'\t' read -r GPU_UTIL_SUMMARY GPU_POWER_SUMMARY GPU_VRAM_SUMMARY GPU_NAME_SUMMARY <<< "$parsed_gpu_summary"
+  fi
+
+  cat << 'EOF'
+   ██████╗ ██████╗ ██╗   ██╗     ██████╗ ██╗   ██╗███████╗██████╗ ██╗      ██████╗  █████╗ ██████╗
+  ██╔════╝ ██╔══██╗██║   ██║    ██╔═══██╗██║   ██║██╔════╝██╔══██╗██║     ██╔═══██╗██╔══██╗██╔══██╗
+  ██║  ███╗██████╔╝██║   ██║    ██║   ██║██║   ██║█████╗  ██████╔╝██║     ██║   ██║███████║██║  ██║
+  ██║   ██║██╔═══╝ ██║   ██║    ██║   ██║╚██╗ ██╔╝██╔══╝  ██╔══██╗██║     ██║   ██║██╔══██║██║  ██║
+  ╚██████╔╝██║     ╚██████╔╝    ╚██████╔╝ ╚████╔╝ ███████╗██║  ██║███████╗╚██████╔╝██║  ██║██████╔╝
+   ╚═════╝ ╚═╝      ╚═════╝      ╚═════╝   ╚═══╝  ╚══════╝╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═════╝
+EOF
+  cat << EOF
+  ================================================================================
+  WARNING: HOST GPU IS OVERLOADED FROM STARTUP (EXTERNAL HOST PROCESS)
+  --------------------------------------------------------------------------------
+  GPU: ${GPU_NAME_SUMMARY} | Load: ${GPU_UTIL_SUMMARY}% | Power: ${GPU_POWER_SUMMARY} | External VRAM: ${GPU_VRAM_SUMMARY}
+  This GPU is already heavily loaded by a process on the host BEFORE ComfyUI
+  started. This cannot be fixed from inside the container.
+  Deployment will continue normally to completion, but inference performance on
+  this pod will be severely degraded. Redeploy this pod on a different host.
+
+  ВНИМАНИЕ: GPU НА ЭТОМ ПОДЕ ПЕРЕГРУЖЕН С САМОГО НАЧАЛА ЗАГРУЗКИ
+  Видеокарту нагружает сторонний процесс на хосте ещё до запуска ComfyUI.
+  Обойти это изнутри контейнера нельзя. Сам под штатно додеплоится до конца,
+  но скорость генерации будет сильно снижена. Рекомендуем пересоздать под на
+  другом хосте.
+  ================================================================================
+EOF
+  echo "[warn][gpu_overload] Host GPU is already overloaded (${GPU_UTIL_SUMMARY}% GPU utilization, ${GPU_POWER_SUMMARY}, ${GPU_VRAM_SUMMARY} external VRAM) before ComfyUI even started — a runaway or background process on the host is consuming this GPU."
+  echo "[warn][gpu_overload_action] Deployment will continue normally to completion, but ComfyUI performance on this pod will be severely degraded. Redeploy this pod on a different host."
+  echo "[warn][gpu_overload_ru] GPU на этом поде уже перегружен (${GPU_UTIL_SUMMARY}% загрузки GPU, ${GPU_POWER_SUMMARY}, ${GPU_VRAM_SUMMARY} занято вне контейнера) с самого начала до запуска ComfyUI — видеокарту нагружает сторонний процесс на самом хосте. Сам под штатно додеплоится до конца, но генерация будет сильно тормозить. Рекомендуем пересоздать под на другом хосте."
+  echo "[warn][gpu_overload_agent] AGENT DEPLOYMENT WARNING: Host GPU is overloaded from the very beginning of pod startup (${GPU_UTIL_SUMMARY}% utilization). Do NOT stop deployment — let the pod deploy to completion, but warn the user prominently that the host GPU is overloaded by a host-level bug/process and recommend moving to another host."
+  echo "[warn][gpu_overload_diag] ${GPU_OVERLOAD_DIAG}"
 fi
 
 # --- Workspace volume preflight (halt if no volume mounted; warn if Global Volume) ---

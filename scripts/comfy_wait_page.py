@@ -60,6 +60,11 @@ WARN_GLOBAL_VOLUME_ACTION_RE = re.compile(r"\[warn\]\[global_volume_action\]\s*(
 WARN_GLOBAL_VOLUME_RU_RE = re.compile(r"\[warn\]\[global_volume_ru\]\s*(.+)", re.I)
 WARN_GLOBAL_VOLUME_AGENT_RE = re.compile(r"\[warn\]\[global_volume_agent\]\s*(.+)", re.I)
 WARN_GLOBAL_VOLUME_DIAG_RE = re.compile(r"\[warn\]\[global_volume_diag\]\s*(.+)", re.I)
+WARN_GPU_OVERLOAD_RE = re.compile(r"\[warn\]\[gpu_overload\]\s*(.+)", re.I)
+WARN_GPU_OVERLOAD_ACTION_RE = re.compile(r"\[warn\]\[gpu_overload_action\]\s*(.+)", re.I)
+WARN_GPU_OVERLOAD_RU_RE = re.compile(r"\[warn\]\[gpu_overload_ru\]\s*(.+)", re.I)
+WARN_GPU_OVERLOAD_AGENT_RE = re.compile(r"\[warn\]\[gpu_overload_agent\]\s*(.+)", re.I)
+WARN_GPU_OVERLOAD_DIAG_RE = re.compile(r"\[warn\]\[gpu_overload_diag\]\s*(.+)", re.I)
 FATAL_CPU_RE = re.compile(r"\[fatal\]\[cpu\]\s*(.+)", re.I)
 FATAL_CPU_ACTION_RE = re.compile(r"\[fatal\]\[cpu_action\]\s*(.+)", re.I)
 CPU_CONFIRM_RE = re.compile(r"\[cpu\]\s+User confirmation received", re.I)
@@ -312,6 +317,7 @@ STAGE_DEFS = [
         "patterns": [
             _regex(r"STAGE:\s*Checking CUDA"),
             _regex(r"STAGE:\s*Host driver failure"),
+            _regex(r"STAGE:\s*Checking GPU load"),
             _regex(r"STAGE:\s*Checking workspace volume"),
             _regex(r"STAGE:\s*No volume disk mounted"),
         ],
@@ -879,6 +885,100 @@ def detect_volume_warning_state(lines):
     }
 
 
+def detect_gpu_overload_warning_state(lines):
+    warn_message = None
+    warn_action = None
+    warn_ru = None
+    warn_agent = None
+    warn_diag = None
+
+    for line in lines:
+        m_msg = WARN_GPU_OVERLOAD_RE.search(line)
+        if m_msg and m_msg.group(1).strip():
+            warn_message = m_msg.group(1).strip()
+
+        m_act = WARN_GPU_OVERLOAD_ACTION_RE.search(line)
+        if m_act and m_act.group(1).strip():
+            warn_action = m_act.group(1).strip()
+
+        m_ru = WARN_GPU_OVERLOAD_RU_RE.search(line)
+        if m_ru and m_ru.group(1).strip():
+            warn_ru = m_ru.group(1).strip()
+
+        m_agent = WARN_GPU_OVERLOAD_AGENT_RE.search(line)
+        if m_agent and m_agent.group(1).strip():
+            warn_agent = m_agent.group(1).strip()
+
+        m_diag = WARN_GPU_OVERLOAD_DIAG_RE.search(line)
+        if m_diag and m_diag.group(1).strip():
+            warn_diag = m_diag.group(1).strip()
+
+    if not (warn_message or warn_action or warn_ru or warn_diag):
+        return {"active": False}
+
+    util_pct = None
+    metrics_parts = []
+    if warn_diag:
+        try:
+            diag_obj = json.loads(warn_diag)
+        except Exception:
+            diag_obj = None
+        if isinstance(diag_obj, dict):
+            raw_util = diag_obj.get("gpu_util_avg")
+            if isinstance(raw_util, (int, float)):
+                util_pct = int(round(raw_util))
+                metrics_parts.append(f"GPU LOAD: {util_pct}%")
+            p_draw = diag_obj.get("power_draw_w")
+            p_lim = diag_obj.get("power_limit_w")
+            if isinstance(p_draw, (int, float)) and isinstance(p_lim, (int, float)):
+                metrics_parts.append(f"POWER: {int(round(p_draw))}W / {int(round(p_lim))}W")
+            elif isinstance(p_draw, (int, float)):
+                metrics_parts.append(f"POWER: {int(round(p_draw))}W")
+            ext_vram = diag_obj.get("external_vram_mib")
+            if isinstance(ext_vram, (int, float)):
+                metrics_parts.append(f"HOST VRAM: {int(round(ext_vram))} MiB")
+            gpu_name = diag_obj.get("gpu_name")
+            if gpu_name:
+                metrics_parts.append(str(gpu_name))
+
+    metrics_line = "  •  ".join(metrics_parts) if metrics_parts else "HOST GPU OVERLOADED BEFORE STARTUP"
+
+    if not warn_message:
+        warn_message = (
+            "Host GPU is already heavily loaded before ComfyUI started — "
+            "a runaway or background process on the host is consuming this GPU."
+        )
+    if not warn_action:
+        warn_action = (
+            "Deployment is continuing normally to completion, but inference performance on this pod "
+            "will be severely degraded. Redeploy this pod on a different host."
+        )
+    if not warn_ru:
+        warn_ru = (
+            "GPU на этом поде перегружен с самого начала до запуска ComfyUI — видеокарту нагружает сторонний процесс на самом хосте. "
+            "Под штатно додеплоится до конца, но генерация будет сильно тормозить. Рекомендуем пересоздать под на другом хосте."
+        )
+    if not warn_agent:
+        warn_agent = (
+            "AGENT DEPLOYMENT WARNING: Host GPU is overloaded from the very beginning of pod startup. "
+            "Do NOT stop deployment — let the pod deploy to completion, but warn the user prominently "
+            "that the host GPU is overloaded by a host-level process and recommend moving to another host."
+        )
+
+    pct_label = f" ({util_pct}%)" if util_pct is not None else ""
+    return {
+        "active": True,
+        "code": "host_gpu_overloaded",
+        "title": f"ВНИМАНИЕ: GPU НА ЭТОМ ПОДЕ ПЕРЕГРУЖЕН{pct_label} / HOST GPU OVERLOADED",
+        "metrics": metrics_line,
+        "message": warn_message,
+        "action": warn_action,
+        "message_ru": warn_ru,
+        "agent_note": warn_agent,
+        "detail": warn_diag,
+    }
+
+
 def compute_stage_states(lines, backup_state, fatal_state):
     stages = []
     skip_ids = set()
@@ -1011,6 +1111,7 @@ def build_state_payload(log_path, continue_file: str = "", cpu_pin_cores: str = 
     backup_state = build_backup_state(lines)
     fatal_state = detect_fatal_state(lines)
     volume_warning_state = detect_volume_warning_state(lines)
+    gpu_overload_warning_state = detect_gpu_overload_warning_state(lines)
     cpu_confirm_state = detect_cpu_confirm_state(lines, continue_file, cpu_pin_cores)
     return {
         "timestamp": time.time(),
@@ -1018,6 +1119,7 @@ def build_state_payload(log_path, continue_file: str = "", cpu_pin_cores: str = 
         "backup": backup_state,
         "fatal": fatal_state,
         "volume_warning": volume_warning_state,
+        "gpu_overload_warning": gpu_overload_warning_state,
         "cpu_confirm": cpu_confirm_state,
         "env": {
             "backup_repo": ENV_INFO["backup_repo"],
@@ -1400,6 +1502,62 @@ HTML_PAGE = """<!doctype html>
       line-height: 1.42;
       white-space: pre-line;
     }
+    .gpu-overload-banner {
+      display: none;
+      width: min(760px, 94vw);
+      margin-top: 24px;
+      border: 2px solid #ff5a36;
+      border-radius: 20px;
+      background: linear-gradient(180deg, rgba(110, 28, 18, 0.78), rgba(58, 16, 12, 0.88));
+      padding: 22px 26px;
+      color: #ffe7de;
+      text-align: left;
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.52);
+    }
+    .gpu-overload-badge {
+      display: inline-block;
+      margin-bottom: 10px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: #f0ff41;
+      color: #161717;
+      font-size: 13px;
+      line-height: 1.2;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .gpu-overload-title {
+      margin: 0 0 10px 0;
+      font-size: clamp(22px, 2.4vw, 30px);
+      line-height: 1.2;
+      font-weight: 800;
+      color: #ffffff;
+    }
+    .gpu-overload-metrics {
+      margin-bottom: 14px;
+      padding: 8px 12px;
+      border-radius: 10px;
+      border: 1px solid rgba(240, 255, 65, 0.4);
+      background: rgba(0, 0, 0, 0.38);
+      color: #f0ff41;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 15px;
+      line-height: 1.35;
+      font-weight: 700;
+    }
+    .gpu-overload-columns {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 16px;
+    }
+    .gpu-overload-detail {
+      margin: 0;
+      color: #ffe7de;
+      font-size: 15px;
+      line-height: 1.48;
+      white-space: pre-line;
+    }
     .cpu-message { display: none; }
     .cpu-support-link {
       display: inline-block;
@@ -1479,7 +1637,7 @@ HTML_PAGE = """<!doctype html>
       .center-column { order: 2; min-height: 360px; }
       .node-catalog { text-align: left; }
       .node-list { max-height: 260px; }
-      .fatal-columns, .cpu-columns, .volume-warning-columns { grid-template-columns: 1fr; }
+      .fatal-columns, .cpu-columns, .volume-warning-columns, .gpu-overload-columns { grid-template-columns: 1fr; }
       .fatal-panel, .cpu-panel { min-height: 0; }
     }
   </style>
@@ -1508,6 +1666,15 @@ HTML_PAGE = """<!doctype html>
           <div class="progress-track" aria-hidden="true"><div class="progress-runner"></div></div>
           <div class="current-stage" data-current-stage>Checking pod health</div>
           <div class="hint-note" data-start-note>If it takes more than 5 minutes, redeploy the pod</div>
+          <div class="gpu-overload-banner" data-gpu-overload-panel>
+            <div class="gpu-overload-badge">HOST GPU ANOMALY — DEPLOYMENT CONTINUING</div>
+            <div class="gpu-overload-title" data-gpu-overload-title></div>
+            <div class="gpu-overload-metrics" data-gpu-overload-metrics></div>
+            <div class="gpu-overload-columns">
+              <div class="gpu-overload-detail" data-gpu-overload-ru></div>
+              <div class="gpu-overload-detail" data-gpu-overload-en></div>
+            </div>
+          </div>
           <div class="volume-warning-banner" data-volume-warning-panel>
             <div class="volume-warning-title" data-volume-warning-title>Warning: Global Volume in Use ($0.10/GB/month)</div>
             <div class="volume-warning-columns">
@@ -1576,6 +1743,11 @@ HTML_PAGE = """<!doctype html>
     const volumeWarningTitle = document.querySelector('[data-volume-warning-title]');
     const volumeWarningEn = document.querySelector('[data-volume-warning-en]');
     const volumeWarningRu = document.querySelector('[data-volume-warning-ru]');
+    const gpuOverloadPanel = document.querySelector('[data-gpu-overload-panel]');
+    const gpuOverloadTitle = document.querySelector('[data-gpu-overload-title]');
+    const gpuOverloadMetrics = document.querySelector('[data-gpu-overload-metrics]');
+    const gpuOverloadEn = document.querySelector('[data-gpu-overload-en]');
+    const gpuOverloadRu = document.querySelector('[data-gpu-overload-ru]');
     const cpuPanel = document.querySelector('[data-cpu-panel]');
     const cpuTitle = document.querySelector('[data-cpu-title]');
     const cpuMessage = document.querySelector('[data-cpu-message]');
@@ -1851,6 +2023,37 @@ HTML_PAGE = """<!doctype html>
       }
     }
 
+    function renderGpuOverloadWarning(gpuWarning) {
+      if (!gpuOverloadPanel) return;
+      const active = !!(gpuWarning && gpuWarning.active);
+      if (!active) {
+        gpuOverloadPanel.style.display = 'none';
+        return;
+      }
+      gpuOverloadPanel.style.display = 'block';
+      if (gpuOverloadTitle) {
+        gpuOverloadTitle.textContent = gpuWarning.title || 'ВНИМАНИЕ: GPU НА ЭТОМ ПОДЕ ПЕРЕГРУЖЕН / HOST GPU OVERLOADED';
+      }
+      if (gpuOverloadMetrics) {
+        const metricsText = gpuWarning.metrics ? String(gpuWarning.metrics).trim() : '';
+        if (metricsText) {
+          gpuOverloadMetrics.style.display = 'block';
+          gpuOverloadMetrics.textContent = metricsText;
+        } else {
+          gpuOverloadMetrics.style.display = 'none';
+          gpuOverloadMetrics.textContent = '';
+        }
+      }
+      const msg = gpuWarning.message || 'Host GPU is already overloaded before ComfyUI started.';
+      const action = gpuWarning.action ? `\n\n${gpuWarning.action}` : '';
+      if (gpuOverloadEn) {
+        gpuOverloadEn.textContent = `${msg}${action}`;
+      }
+      if (gpuOverloadRu) {
+        gpuOverloadRu.textContent = gpuWarning.message_ru || 'GPU на этом поде перегружен с самого начала до запуска ComfyUI — видеокарту нагружает сторонний процесс на самом хосте. Сам под штатно додеплоится до конца, но генерация будет сильно тормозить. Рекомендуем пересоздать под на другом хосте.';
+      }
+    }
+
     function renderCpuConfirm(cpuConfirm) {
       const required = !!(cpuConfirm && cpuConfirm.required);
       const confirmed = !!(cpuConfirm && cpuConfirm.confirmed);
@@ -1974,6 +2177,7 @@ HTML_PAGE = """<!doctype html>
         if (res.ok) {
           const data = await res.json();
           renderFatal(data.fatal);
+          renderGpuOverloadWarning(data.gpu_overload_warning);
           renderVolumeWarning(data.volume_warning);
           renderCpuConfirm(data.cpu_confirm);
           renderStages(data.stages);
