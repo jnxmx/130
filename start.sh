@@ -2461,7 +2461,38 @@ prune_package_caches() {
 ensure_comfy_venv_ready "$VIRTUAL_ENV"
 activate_comfy_venv
 
+migrate_manager_settings
+cleanup_legacy_manager
+
+# Remove deprecated Comfyui_Minimax_h3_latent_Upscaler custom node (now native in ComfyUI)
+for _obs_node in "/workspace/ComfyUI/custom_nodes/Comfyui_Minimax_h3_latent_Upscaler" "/Comfy/custom_nodes/Comfyui_Minimax_h3_latent_Upscaler"; do
+  if [[ -d "$_obs_node" ]]; then
+    rm -rf "$_obs_node"
+    echo "[nodes] removed deprecated custom node $(basename "$_obs_node") (native in ComfyUI)"
+  fi
+done
+
+if [[ "${NEW_MANAGER:-0}" == "1" ]]; then
+  echo "STAGE: Ensuring ComfyUI Manager (pip)"
+  if [[ "$USE_UV" == "1" ]]; then
+    _mgr_link_mode="$(uv_link_mode_for_python "$VIRTUAL_ENV/bin/python")"
+    _mgr_cargs=()
+    if [[ -n "${PIP_CONSTRAINT:-}" ]]; then
+      _mgr_cargs=(--constraint "$PIP_CONSTRAINT")
+    fi
+    if ! UV_LINK_MODE="$_mgr_link_mode" uv pip install --python "$VIRTUAL_ENV/bin/python" "${_mgr_cargs[@]}" --upgrade-package comfyui-manager comfyui-manager; then
+      echo "[deps][warn] uv manager install failed; falling back to pip..."
+      USE_UV=0 pip_install "$VIRTUAL_ENV/bin/python" --upgrade comfyui-manager
+    fi
+  else
+    pip_install "$VIRTUAL_ENV/bin/python" --upgrade comfyui-manager
+  fi
+else
+  echo "[manager] NEW_MANAGER!=1; skipping pip-installed Manager"
+fi
+
 # --- First boot: update baked /Comfy on local container disk before persisting to /workspace ---
+FIRST_BOOT_REPO_UPDATES_DONE=0
 if [[ ! -d /workspace/ComfyUI && -d /Comfy ]]; then
   image_comfy_head="$(current_image_comfy_head)"
   if [[ "${ENABLE_RUNTIME_REPO_UPDATES:-1}" == "1" ]]; then
@@ -2469,6 +2500,7 @@ if [[ ! -d /workspace/ComfyUI && -d /Comfy ]]; then
     ( update_comfyui_core /Comfy ) || true
     update_custom_nodes_parallel /Comfy/custom_nodes || true
     prune_package_caches
+    FIRST_BOOT_REPO_UPDATES_DONE=1
   fi
   echo "Persisting ComfyUI to /workspace (first boot)…"
   mv /Comfy /workspace/ComfyUI
@@ -2499,39 +2531,6 @@ if [[ -d /workspace/ComfyUI/models ]]; then
 fi
 
 run_model_sync
-
-migrate_manager_settings
-cleanup_legacy_manager
-
-# Remove deprecated Comfyui_Minimax_h3_latent_Upscaler custom node (now native in ComfyUI)
-for _obs_node in "/workspace/ComfyUI/custom_nodes/Comfyui_Minimax_h3_latent_Upscaler" "/Comfy/custom_nodes/Comfyui_Minimax_h3_latent_Upscaler"; do
-  if [[ -d "$_obs_node" ]]; then
-    rm -rf "$_obs_node"
-    echo "[nodes] removed deprecated custom node $(basename "$_obs_node") (native in ComfyUI)"
-  fi
-done
-
-# --- Ensure venv active + Manager policies ---
-activate_comfy_venv
-
-if [[ "${NEW_MANAGER:-0}" == "1" ]]; then
-  echo "STAGE: Ensuring ComfyUI Manager (pip)"
-  if [[ "$USE_UV" == "1" ]]; then
-    _mgr_link_mode="$(uv_link_mode_for_python "$VIRTUAL_ENV/bin/python")"
-    _mgr_cargs=()
-    if [[ -n "${PIP_CONSTRAINT:-}" ]]; then
-      _mgr_cargs=(--constraint "$PIP_CONSTRAINT")
-    fi
-    if ! UV_LINK_MODE="$_mgr_link_mode" uv pip install --python "$VIRTUAL_ENV/bin/python" "${_mgr_cargs[@]}" --upgrade-package comfyui-manager comfyui-manager; then
-      echo "[deps][warn] uv manager install failed; falling back to pip..."
-      USE_UV=0 pip_install "$VIRTUAL_ENV/bin/python" --upgrade comfyui-manager
-    fi
-  else
-    pip_install "$VIRTUAL_ENV/bin/python" --upgrade comfyui-manager
-  fi
-else
-  echo "[manager] NEW_MANAGER!=1; skipping pip-installed Manager"
-fi
 
 ensure_manager_policy_files
 cleanup_legacy_manager_settings_dir
@@ -2767,7 +2766,7 @@ find_hf_downloader_nodepack() {
 #   models -> same nodepack function, one file at a time (skips files already complete),
 #             clearing the HF cache after each file so disk usage never doubles.
 hfd_restore() {
-  (cd /workspace && COMFY_ROOT=/workspace/ComfyUI "$VIRTUAL_ENV/bin/python" - "$1" <<'PY'
+  (cd /workspace && COMFY_ROOT=/workspace/ComfyUI NEW_MANAGER="${NEW_MANAGER:-0}" "$VIRTUAL_ENV/bin/python" - "$1" <<'PY'
 import importlib, os, shutil, subprocess, sys, types
 
 mode = sys.argv[1]
@@ -2815,6 +2814,8 @@ def apply_staged_snapshot():
         return name.replace("-", "").replace("_", "")
 
     installed_norm = {norm(d) for d in os.listdir(nodes_dir)}
+    if os.environ.get("NEW_MANAGER") == "1":
+        installed_norm.add("comfyuimanager")
 
     with open(staged, encoding="utf-8") as fh:
         snap = yaml.safe_load(fh) or {}
@@ -2938,6 +2939,7 @@ echo "RESTORE_BACKUP: ${RESTORE_BACKUP:-}"
 echo "COMFYUI_BACKUP: ${COMFYUI_BACKUP:-}"
 RESTORE_JUST_RAN=0
 if [[ "${RESTORE_BACKUP:-0}" == "1" && -n "${COMFYUI_BACKUP:-}" && -d "/workspace/ComfyUI" && ! -f "/workspace/.restore_nodes_done" && ! -f "/workspace/.restore_done" ]]; then
+  echo "STAGE: Backup node restore"
   echo "[restore] first-boot restore enabled"
   echo "[INFO] First-boot custom nodes restore from ${COMFYUI_BACKUP}…"
   if ! "$VIRTUAL_ENV/bin/python" -c "import huggingface_hub, yaml, hf_transfer" 2>/dev/null; then
@@ -2957,6 +2959,9 @@ if [[ "${RESTORE_BACKUP:-0}" == "1" && -n "${COMFYUI_BACKUP:-}" && -d "/workspac
       echo "[restore] custom nodes restore complete"
     else
       echo "[restore][error] custom nodes restore failed; will retry on next boot"
+    fi
+    if [[ "${NEW_MANAGER:-0}" == "1" ]]; then
+      cleanup_legacy_manager
     fi
   else
     echo "[restore][warn] ComfyUI_HuggingFace_Downloader nodepack (backup.py) not found; skipping restore"
@@ -3073,8 +3078,13 @@ apply_runtime_comfy_settings
 if [[ -d /workspace/ComfyUI ]]; then
   if [[ "${ENABLE_RUNTIME_REPO_UPDATES:-1}" != "1" ]]; then
     echo "[updates] runtime git/custom-node updates disabled; keeping persisted workspace versions"
+  elif [[ "${FIRST_BOOT_REPO_UPDATES_DONE:-0}" == "1" ]]; then
+    echo "[updates] ComfyUI core and custom nodes already updated during first boot; skipping duplicate pass"
+    if [[ "${RESTORE_JUST_RAN:-0}" == "1" ]]; then
+      prune_package_caches
+    fi
   else
-    # Even after restore, refresh preinstalled and runtime custom nodes to the latest version.
+    # Refresh preinstalled and runtime custom nodes on subsequent boots.
     echo "STAGE: Updating ComfyUI and custom nodes"
     update_comfyui_core /workspace/ComfyUI || true
     update_custom_nodes_parallel /workspace/ComfyUI/custom_nodes || true
@@ -3538,10 +3548,12 @@ export -f is_pid_alive
 export -f is_fizgig_venv_healthy
 export -f placeholder_running
 export -f stop_placeholder_process
+export -f uv_link_mode_for_python
 export -f pip_install
 export -f pip_install_requirements
 export -f prepare_fizgig_runtime
 export -f configure_cpu_thread_limits
+export -f ensure_empty_default_workflow
 export -f launch_comfyui_runtime
 export -f launch_fizgig_runtime
 export -f comfy_venv_system_python
