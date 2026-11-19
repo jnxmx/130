@@ -3,7 +3,6 @@
     "KJNodes.browserStatus": true,
     "KJNodes.nodeAutoColor": false,
     "Comfy.WidgetControlMode": "before",
-    "Crystools.ShowHdd": true,
     "VHS.LatentPreview": false,
     "Comfy.Locale": "en",
     "Comfy.ColorPalette": "nord",
@@ -27,10 +26,6 @@
     "EasyUse.Nodes.Runtime": false,
     "EasyUse.NodesMap.Enable": false,
     "EasyUse.NodesMap.DisplayNodeID": false,
-    "Crystools.WhichHdd": "/workspace",
-    "Crystools.ShowGpuTemperatureZero": false,
-    "Crystools.ProgressBar": false,
-    "Crystools.MonitorHeight": 16,
     "Comfy.Sidebar.Style": "floating",
     "Comfy.Sidebar.Location": "left",
     "Comfy.Sidebar.Size": "normal",
@@ -39,6 +34,5 @@
         "ComfyUI"
     ],
     "Comfy.VueNodes.Enabled": true,
-    "Crystools.ShowCpu": false,
     "loramanager.usage_statistics": false
 }

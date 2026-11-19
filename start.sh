@@ -3003,7 +3003,6 @@ apply_runtime_comfy_settings() {
          | ."loramanager.usage_statistics" = false
          | ."Comfy.Execution.PreviewMethod" = "taesd"
          | ."VHS.LatentPreview" = false
-         | ."Crystools.MonitorHeight" = 16
          | (if $repo != "" then ."downloaderbackup.repo_name" = $repo else . end)
          | (if $disable_timer == 1 then ."runpod.enable_shutdown_timer" = false else . end)' \
         "$settings" > "$tmp" && mv "$tmp" "$settings"; then
