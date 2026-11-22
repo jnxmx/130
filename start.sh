@@ -398,6 +398,10 @@ try:
         idx = torch.cuda.current_device()
         result["device_index"] = int(idx)
         result["device_name"] = str(torch.cuda.get_device_name(idx))
+        torch.cuda.mem_get_info(idx)
+        probe_tensor = torch.zeros(1, device=f"cuda:{idx}")
+        torch.cuda.synchronize(idx)
+        del probe_tensor
         result["ok"] = True
     else:
         result["error"] = "torch.cuda.is_available() returned False"
@@ -3474,7 +3478,7 @@ launch_comfyui_runtime() {
     comfy_args+=(--disable-cuda-malloc)
   else
     local is_blackwell=0
-    if nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -qiE 'RTX 50|Blackwell|B100|B200|GB200|B300'; then
+    if nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -qiE 'RTX 50[5-9]0|Blackwell|B100|B200|GB200|B300'; then
       is_blackwell=1
     else
       local ccap
