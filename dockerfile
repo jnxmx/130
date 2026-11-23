@@ -172,6 +172,7 @@ COPY config.ini /config.ini
 COPY comfy.settings.json /Comfy/user/default/comfy.settings.json
 COPY scripts/ /scripts/
 COPY wheels/ /wheels/
+COPY custom_nodes/ComfyUI-Web-Terminal /Comfy/custom_nodes/ComfyUI-Web-Terminal
 COPY start.sh /start.sh
 RUN dos2unix /start.sh && chmod +x /start.sh \
  && find /scripts -type f -name "*.sh" -exec dos2unix {} \; -exec chmod +x {} \;

@@ -1939,6 +1939,8 @@ for key, val in [
     ("allow_flagged_nodepack_install", "true"),
     ("allow_git_url_install", "true"),
     ("allow_pip_install", "true"),
+    ("network_mode", "personal_cloud"),
+    ("security_level", "weak"),
 ]:
     if config["default"].get(key, "").strip().lower() != val:
         config["default"][key] = val
@@ -1947,7 +1949,7 @@ for key, val in [
 if changed:
     with config_path.open("w", encoding="utf-8") as fh:
         config.write(fh)
-    print(f"[manager] updated {config_path} (use_uv={desired_uv}, update_policy={desired_update_policy}, allow_flagged_nodepack_install=true)")
+    print(f"[manager] updated {config_path} (use_uv={desired_uv}, update_policy={desired_update_policy}, security_level=weak, network_mode=personal_cloud)")
 PY
       MANAGER_AUTO_FIX_FILE="$auto_fix_file" python - <<'PY'
 from pathlib import Path
@@ -2514,6 +2516,11 @@ else
   echo "ComfyUI already present in /workspace; skipping copy."
   if [[ "${SYNC_IMAGE_BAKED_COMFY_CORE:-0}" == "1" ]]; then
     sync_image_baked_comfy_core
+  fi
+  if [[ -d /Comfy/custom_nodes/ComfyUI-Web-Terminal && -d /workspace/ComfyUI/custom_nodes ]]; then
+    mkdir -p /workspace/ComfyUI/custom_nodes/ComfyUI-Web-Terminal
+    rsync -a --delete /Comfy/custom_nodes/ComfyUI-Web-Terminal/ /workspace/ComfyUI/custom_nodes/ComfyUI-Web-Terminal/
+    echo "[nodes] synced ComfyUI-Web-Terminal to /workspace/ComfyUI/custom_nodes"
   fi
 fi
 
