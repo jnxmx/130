@@ -33,3 +33,5 @@ temp/
 !scripts/**
 !wheels/
 !wheels/**
+!custom_nodes/
+!custom_nodes/**
