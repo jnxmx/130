@@ -1,10 +1,7 @@
-This directory vendors the File Browser "Modern" theme locally so runtime does not depend on a remote CDN or repository.
+Custom dark File Browser theme aligned with the Comfy Desktop / Comfy.Work UI design system.
 
-Source:
-- Repository: https://github.com/Teraskull/file-browser-modern-theme
-- Commit: d8334b57bf6cd2b3d6d96ae8c9b6a2f073873a0c
-- License: AGPL-3.0 (see `LICENSE.file-browser-modern-theme`)
+Contents:
+- `custom.css` — dark monochrome palette (`#0c0c0c` canvas, `#171717` cards/modals with backdrop blur, `#232323` inputs, `#f5f5f7` primary buttons).
+- `img/logo.svg` — minimal folder icon for the File Browser header.
 
-Notes:
-- `custom.css` is copied from upstream and lightly adjusted to remove the Google Fonts import.
-- `start.sh` configures File Browser with `branding.files=/scripts/filebrowser_branding`.
+Applied automatically at container startup by `start.sh` via `filebrowser config set --branding.files /scripts/filebrowser_branding --branding.theme dark`.

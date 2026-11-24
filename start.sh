@@ -1612,12 +1612,25 @@ PY
 )
 
 FILEBROWSER_BRANDING_DIR="${FILEBROWSER_BRANDING_DIR:-/scripts/filebrowser_branding}"
+FILEBROWSER_DB="${FILEBROWSER_DB:-/tmp/filebrowser.db}"
 if [[ -d "$FILEBROWSER_BRANDING_DIR" ]]; then
   echo "[filebrowser] custom branding enabled from $FILEBROWSER_BRANDING_DIR"
-  FB_BRANDING_FILES="$FILEBROWSER_BRANDING_DIR" filebrowser --address=0.0.0.0 --port=8080 --root=/workspace/ --noauth &
+  if [[ ! -f "$FILEBROWSER_DB" ]]; then
+    filebrowser -d "$FILEBROWSER_DB" config init --auth.method=noauth --address=0.0.0.0 --port=8080 --root=/workspace/ >/dev/null 2>&1 || true
+    filebrowser -d "$FILEBROWSER_DB" users add admin "comfywork-noauth-admin" --perm.admin --viewMode=mosaic --hideDotfiles >/dev/null 2>&1 || true
+  fi
+  filebrowser -d "$FILEBROWSER_DB" users update admin --hideDotfiles >/dev/null 2>&1 || true
+  filebrowser -d "$FILEBROWSER_DB" config set \
+    --auth.method=noauth \
+    --branding.name "FileBrowser" \
+    --branding.files "$FILEBROWSER_BRANDING_DIR" \
+    --branding.theme dark \
+    --branding.disableExternal \
+    --hideDotfiles >/dev/null 2>&1 || true
+  filebrowser -d "$FILEBROWSER_DB" --address=0.0.0.0 --port=8080 --root=/workspace/ --noauth &
 else
   echo "[filebrowser][warn] branding directory not found: $FILEBROWSER_BRANDING_DIR"
-  filebrowser --address=0.0.0.0 --port=8080 --root=/workspace/ --noauth &
+  filebrowser -d "$FILEBROWSER_DB" --address=0.0.0.0 --port=8080 --root=/workspace/ --noauth &
 fi
 ensure_nginx_started || true
 
