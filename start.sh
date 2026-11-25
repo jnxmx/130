@@ -1030,7 +1030,27 @@ keep_comfy_wait_stack_alive_forever() {
   done
 }
 
+write_comfy_env_init_script() {
+  local target="/tmp/comfy_env_init.js"
+  local tmp="${target}.tmp"
+  if [[ "${STUDENT_MODE:-0}" == "1" ]] || [[ -z "${API_KEY_COMFY_ORG:-}" ]] || [[ "${API_KEY_COMFY_ORG}" == *"RUNPOD_SECRET_"* ]]; then
+    printf '/* comfy_env_init: disabled */\n' > "$tmp"
+  else
+    python3 - <<'PY' > "$tmp"
+import json, os
+key = os.environ.get("API_KEY_COMFY_ORG", "").strip()
+if key:
+    print("(function(){try{if(!localStorage.getItem('comfy_api_key')){localStorage.setItem('comfy_api_key'," + json.dumps(key) + ");}}catch(_){}})();")
+else:
+    print("/* comfy_env_init: disabled */")
+PY
+  fi
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$target"
+}
+
 # Start placeholder before any preflight checks so failures are visible in UI.
+write_comfy_env_init_script || true
 start_comfy_placeholder || true
 ensure_nginx_started || true
 
