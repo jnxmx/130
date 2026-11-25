@@ -3486,6 +3486,9 @@ launch_comfyui_runtime() {
   if [[ "${NEW_MANAGER:-0}" == "1" ]]; then
     comfy_args+=(--enable-manager)
   fi
+  if [[ "${NIGHTLY_COMFYUI:-0}" == "1" ]]; then
+    comfy_args+=(--enable-agent)
+  fi
   if [[ "${DISABLE_PM:-0}" == "1" ]]; then
     comfy_args+=(--disable-pinned-memory)
   fi
