@@ -3506,7 +3506,7 @@ launch_comfyui_runtime() {
   fi
   ensure_empty_default_workflow
   echo "STAGE: Starting ComfyUI"
-  local comfy_args=(--listen 0.0.0.0 --port 8188 --enable-cors-header "*")
+  local comfy_args=(--listen 0.0.0.0 --port 8188 --enable-cors-header "*" --enable-assets)
   if [[ "${NEW_MANAGER:-0}" == "1" ]]; then
     comfy_args+=(--enable-manager)
   fi
