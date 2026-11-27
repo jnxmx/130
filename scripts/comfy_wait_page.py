@@ -331,6 +331,7 @@ STAGE_DEFS = [
             _regex(r"ComfyUI already present"),
             _regex(r"Creating venv"),
             _regex(r"VIRTUAL_ENV:"),
+            _regex(r"STAGE:\s*Ensuring NVIDIA NGX"),
         ],
     },
     {

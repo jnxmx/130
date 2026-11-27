@@ -90,6 +90,7 @@ The template includes multiple defensive hooks designed to mitigate common failu
 | Proxy CORS & Host Header Rejection| Nginx Dynamic Host/Origin Header Rewriting    |
 | Unresponsive Child Processes      | Process Group (PGID) + Descendant Killing     |
 | Image Core Updates vs Persisted WS| Core File Sync Manifest (.image_baked_core)   |
+| Missing Host NGX Driver Runtime   | `ensure_nvidia_ngx.py` (Cache + .deb/.run)    |
 +-----------------------------------+-----------------------------------------------+
 ```
 
@@ -153,6 +154,14 @@ The template includes multiple defensive hooks designed to mitigate common failu
   - Collects all descendant PIDs recursively using `collect_descendants`.
   - Issues SIGTERM to the process group, polls status, and issues SIGKILL to remaining process groups and child processes.
 
+### Hook H: NVIDIA NGX Runtime Auto-Bootstrap (`ensure_nvidia_ngx.py`)
+- **Target Files**: [dockerfile](file:///Users/jnx/Documents/GitHub/130/dockerfile), [start.sh](file:///Users/jnx/Documents/GitHub/130/start.sh), [ensure_nvidia_ngx.py](file:///Users/jnx/Documents/GitHub/130/scripts/ensure_nvidia_ngx.py)
+- **Problem**: Cloud hosts frequently launch containers with `compute,utility` capabilities (omitting `libnvidia-ngx.so.1`), causing `ComfyUI_Nvidia_VFX_Nodes` (`RTXVideoSuperResolution`, etc.) to fail with `NvVFX_Load failed (code -12)`.
+- **Mechanism**:
+  - Sets `NVIDIA_DRIVER_CAPABILITIES=all` in the image and includes Mesa `llvmpipe` / Vulkan `lavapipe` packages for headless `GLSL Shader` fallback when `/dev/dri` is blocked.
+  - On startup, probes `libnvidia-ngx.so.1` via `dlopen(..., RTLD_NOW)` in a fresh subprocess.
+  - If missing, restores a driver-versioned `.tar.zst` cache from `/workspace/.cache/nvidia-ngx/` to `/opt/nvidia-ngx/<driver_ver>/lib` + `ldconfig`, or downloads the exact matching `.deb` / `.run` userspace NGX libraries (strictly filtering out compute libraries and skipping host-provided SONAMEs).
+
 ---
 
 ## 4. Reverse Proxy & Port Strategy
@@ -212,3 +221,4 @@ Instead of serving generic static 502 pages, the system includes three Python HT
 | `NEW_MANAGER` | `0` | Installs modern `comfyui-manager` via pip instead of legacy git node. |
 | `DISABLE_SHUTDOWN_TIMER` | `0` | Set to `1` (or `RUNPOD_DISABLE_SHUTDOWN_TIMER=1`) to disable the auto-shutdown timer in ComfyUI-RunPod-Control. |
 | `FIZGIG_UPDATE` | `1` | Automatically pulls latest Fizgig git updates on container startup. |
+| `ENSURE_NVIDIA_NGX` | `1` | Automatically checks `libnvidia-ngx.so.1` on startup and restores/fetches missing NGX runtime libraries if absent. |

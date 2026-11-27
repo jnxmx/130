@@ -2580,6 +2580,18 @@ ensure_manager_policy_files
 cleanup_legacy_manager_settings_dir
 patch_legacy_manager_blacklist_guard
 
+ensure_nvidia_ngx_runtime() {
+  local ngx_script="/scripts/ensure_nvidia_ngx.py"
+  if [[ ! -f "$ngx_script" && -f "/workspace/scripts/ensure_nvidia_ngx.py" ]]; then
+    ngx_script="/workspace/scripts/ensure_nvidia_ngx.py"
+  fi
+  if [[ -f "$ngx_script" ]]; then
+    python3 "$ngx_script" || true
+  fi
+}
+
+ensure_nvidia_ngx_runtime
+
 # --- Install/build sageattention based on GPU architecture ---
 SAGEATTENTION_VERSION="2.2.0"
 SAGE_WHEEL_OUTPUT_DIR="/workspace/wheels"

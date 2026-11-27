@@ -6,15 +6,20 @@ ARG PYTORCH=2.13.0
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=Europe/London \
     PYTHONUNBUFFERED=1 \
-    SHELL=/bin/bash
+    SHELL=/bin/bash \
+    NVIDIA_DRIVER_CAPABILITIES=all
 
-# Install system dependencies (extra EGL/OpenGL libraries & utilities missing in base image)
+# Install system dependencies (extra EGL/OpenGL/Vulkan libraries & utilities missing in base image)
 RUN apt update && apt install -y --no-install-recommends \
     libglu1-mesa \
     libopengl0 \
     libegl1 \
     libgles2 \
     libegl-mesa0 \
+    libgl1-mesa-dri \
+    libgbm1 \
+    libvulkan1 \
+    mesa-vulkan-drivers \
     dos2unix \
     file \
     ncdu \
@@ -224,6 +229,7 @@ ENV HF_HOME="/workspace/.cache/huggingface" \
     INSIGHTFACE_HOME="/workspace/.cache/insightface" \
     FIZGIG_HOME="/workspace/Fizgig" \
     FIZGIG_POD=1 \
-    NIGHTLY_COMFYUI=0
+    NIGHTLY_COMFYUI=0 \
+    ENSURE_NVIDIA_NGX=1
 
 CMD ["/start.sh"]
