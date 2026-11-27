@@ -46,8 +46,7 @@ HARD_DENY_PATTERNS = (
 
 NGX_ALLOW_PATTERNS = (
     "libnvidia-ngx.so*",
-    "nvngx*",
-    "_nvngx*",
+    "nvngx*.bin",
 )
 
 COMPANION_ALLOW_PATTERNS = (
@@ -123,8 +122,8 @@ def detect_driver_version() -> Optional[str]:
 def probe_ngx_load_in_subprocess(timeout: int = 10) -> tuple[bool, str]:
     """Probe libnvidia-ngx.so.1 in a fresh child process so ld.so.cache is fresh."""
     code = (
-        "import ctypes\n"
-        "ctypes.CDLL('libnvidia-ngx.so.1', mode=ctypes.RTLD_NOW)\n"
+        "import ctypes, os\n"
+        "ctypes.CDLL('libnvidia-ngx.so.1', mode=getattr(os, 'RTLD_NOW', 2))\n"
         "print('OK')\n"
     )
     try:
