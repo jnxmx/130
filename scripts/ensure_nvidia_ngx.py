@@ -13,6 +13,7 @@ from __future__ import annotations
 import ctypes
 import fnmatch
 import glob
+import gzip
 import json
 import os
 import platform
@@ -64,10 +65,12 @@ COMPANION_ALLOW_PATTERNS = (
 
 ALL_ALLOW_PATTERNS = NGX_ALLOW_PATTERNS + COMPANION_ALLOW_PATTERNS
 
+DEBIAN12_CUDA_REPO = "https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/"
 DEFAULT_OPT_ROOT = Path("/opt/nvidia-ngx")
 DEFAULT_CACHE_DIR = Path("/workspace/.cache/nvidia-ngx")
 DEFAULT_LEGACY_NVDRV = Path("/workspace/nvdrv")
-DEFAULT_LD_CONF = Path("/etc/ld.so.conf.d/99-nvidia-ngx-fallback.conf")
+DEFAULT_LD_CONF = Path("/etc/ld.so.conf.d/00-nvidia-ngx.conf")
+LEGACY_LD_CONF = Path("/etc/ld.so.conf.d/99-nvidia-ngx-fallback.conf")
 DEFAULT_EGL_VENDOR_DIR = Path("/usr/share/glvnd/egl_vendor.d")
 DEFAULT_VULKAN_ICD_DIR = Path("/etc/vulkan/icd.d")
 
@@ -119,23 +122,48 @@ def detect_driver_version() -> Optional[str]:
     return None
 
 
-def probe_ngx_load_in_subprocess(timeout: int = 10) -> tuple[bool, str]:
-    """Probe libnvidia-ngx.so.1 in a fresh child process so ld.so.cache is fresh."""
+def _resolve_probe_python() -> str:
+    venv_dir = os.environ.get("VIRTUAL_ENV", "").strip()
+    if venv_dir:
+        candidate = Path(venv_dir) / "bin" / "python"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return sys.executable
+
+
+def probe_ngx_load_in_subprocess(timeout: int = 30) -> tuple[bool, str]:
+    """Probe libnvidia-ngx.so.1 (and nvvfx when available) in a fresh child process."""
+    probe_vfx = is_truthy(os.environ.get("ENSURE_NVIDIA_NGX_PROBE_VFX"), default=True)
+    probe_py = _resolve_probe_python()
     code = (
-        "import ctypes, os\n"
+        "import ctypes, os, sys\n"
+        "probe_vfx = bool(int(sys.argv[1]))\n"
         "ctypes.CDLL('libnvidia-ngx.so.1', mode=getattr(os, 'RTLD_NOW', 2))\n"
-        "print('OK')\n"
+        "if not probe_vfx:\n"
+        "    print('OK:dlopen-only')\n"
+        "    raise SystemExit(0)\n"
+        "try:\n"
+        "    import nvvfx\n"
+        "except ImportError:\n"
+        "    print('OK:dlopen-only')\n"
+        "    raise SystemExit(0)\n"
+        "with nvvfx.VideoSuperRes(nvvfx.VideoSuperRes.QualityLevel.LOW) as sr:\n"
+        "    sr.output_width = 64\n"
+        "    sr.output_height = 64\n"
+        "    sr.load()\n"
+        "print('OK:nvvfx')\n"
     )
     try:
         proc = subprocess.run(
-            [sys.executable, "-c", code],
+            [probe_py, "-c", code, "1" if probe_vfx else "0"],
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
         )
-        if proc.returncode == 0 and "OK" in (proc.stdout or ""):
-            return True, "OK"
+        stdout_lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+        if proc.returncode == 0 and any("OK:" in line for line in stdout_lines):
+            return True, stdout_lines[-1]
         err = (proc.stderr or proc.stdout or f"exit={proc.returncode}").strip().splitlines()
         return False, err[-1] if err else f"exit={proc.returncode}"
     except Exception as exc:
@@ -211,10 +239,100 @@ def is_library_allowed(
 
 
 def build_deb_url(driver_version: str) -> str:
-    return (
-        "https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/"
-        f"libnvidia-ngx1_{driver_version}-1_amd64.deb"
+    return f"{DEBIAN12_CUDA_REPO}libnvidia-ngx1_{driver_version}-1_amd64.deb"
+
+
+def version_tuple(version: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in version.split(".") if x.isdigit())
+
+
+def parse_debian_packages_ngx(packages_text: str) -> list[tuple[str, str]]:
+    """Extract (driver_version, filename) pairs for libnvidia-ngx1 from Debian Packages."""
+    results: list[tuple[str, str]] = []
+    for stanza in re.split(r"\r?\n\r?\n+", packages_text):
+        if not stanza.strip():
+            continue
+        pkg = None
+        version = None
+        filename = None
+        for line in stanza.splitlines():
+            if line.startswith("Package:"):
+                pkg = line.split(":", 1)[1].strip()
+            elif line.startswith("Version:"):
+                version = line.split(":", 1)[1].strip()
+            elif line.startswith("Filename:"):
+                filename = line.split(":", 1)[1].strip()
+        if pkg != "libnvidia-ngx1" or not version or not filename:
+            continue
+        upstream_ver = version.split("-", 1)[0].split(":", 1)[-1]
+        if DRIVER_VERSION_RE.match(upstream_ver):
+            results.append((upstream_ver, filename.lstrip("./")))
+    return results
+
+
+def select_deb_candidates(
+    driver_version: str,
+    available: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """Order libnvidia-ngx1 .deb URLs: exact match, newer same branch, newer branches."""
+    by_version: dict[str, str] = {}
+    for ver, filename in available:
+        if ver not in by_version:
+            by_version[ver] = f"{DEBIAN12_CUDA_REPO}{filename.lstrip('/')}"
+
+    target_major = driver_version.split(".")[0]
+    target_tuple = version_tuple(driver_version)
+
+    candidates: list[tuple[str, str]] = []
+    if driver_version in by_version:
+        candidates.append((driver_version, by_version[driver_version]))
+
+    same_branch_newer = sorted(
+        (
+            ver for ver in by_version
+            if ver != driver_version
+            and ver.split(".")[0] == target_major
+            and version_tuple(ver) > target_tuple
+        ),
+        key=version_tuple,
+        reverse=True,
     )
+    for ver in same_branch_newer[:2]:
+        candidates.append((ver, by_version[ver]))
+
+    other_branch_newer = sorted(
+        (
+            ver for ver in by_version
+            if ver.split(".")[0] != target_major
+            and version_tuple(ver) > target_tuple
+        ),
+        key=version_tuple,
+        reverse=True,
+    )
+    for ver in other_branch_newer[:2]:
+        candidates.append((ver, by_version[ver]))
+
+    return candidates
+
+
+def fetch_debian12_ngx_candidates(
+    driver_version: str,
+    timeout: int = 15,
+) -> list[tuple[str, str]]:
+    """Discover libnvidia-ngx1 .deb URLs from NVIDIA's Debian 12 CUDA repo."""
+    packages_url = f"{DEBIAN12_CUDA_REPO}Packages.gz"
+    try:
+        req = urllib.request.Request(packages_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            compressed = resp.read()
+        packages_text = gzip.decompress(compressed).decode("utf-8", errors="ignore")
+        available = parse_debian_packages_ngx(packages_text)
+        selected = select_deb_candidates(driver_version, available)
+        if selected:
+            return selected
+    except Exception as exc:
+        warn(f"could not fetch Debian 12 CUDA Packages.gz ({exc}); using direct URL fallback")
+    return [(driver_version, build_deb_url(driver_version))]
 
 
 def build_run_mirror_urls(driver_version: str) -> list[str]:
@@ -399,6 +517,8 @@ def register_ld_conf(
     ld_conf_path: Path = DEFAULT_LD_CONF,
 ) -> None:
     ld_conf_path.parent.mkdir(parents=True, exist_ok=True)
+    if ld_conf_path != LEGACY_LD_CONF and LEGACY_LD_CONF.exists():
+        LEGACY_LD_CONF.unlink(missing_ok=True)
     ld_conf_path.write_text(f"{lib_dir}\n", encoding="utf-8")
     subprocess.run(["ldconfig"], check=False)
 
@@ -466,7 +586,7 @@ def maybe_register_graphics_icds(
 
 def find_cached_archive(cache_dir: Path, driver_version: str) -> Optional[Path]:
     for ext in (".tar.zst", ".tar.gz"):
-        candidate = cache_dir / f"ngx-{driver_version}{ext}"
+        candidate = cache_dir / f"ngx-v2-{driver_version}{ext}"
         if candidate.is_file() and candidate.stat().st_size > 0:
             return candidate
     return None
@@ -518,8 +638,8 @@ def save_cache_archive(
         cache_dir.mkdir(parents=True, exist_ok=True)
         use_zstd = shutil.which("zstd") is not None
         ext = ".tar.zst" if use_zstd else ".tar.gz"
-        final_path = cache_dir / f"ngx-{driver_version}{ext}"
-        tmp_path = cache_dir / f".ngx-{driver_version}.{os.getpid()}{ext}.tmp"
+        final_path = cache_dir / f"ngx-v2-{driver_version}{ext}"
+        tmp_path = cache_dir / f".ngx-v2-{driver_version}.{os.getpid()}{ext}.tmp"
         tmp_path.unlink(missing_ok=True)
 
         cmd = (
@@ -595,34 +715,41 @@ def try_migrate_legacy_nvdrv(
 
 
 def bootstrap_from_deb(
-    driver_version: str,
+    pkg_version: str,
     dest_lib_dir: Path,
     host_sonames: set[str],
     work_dir: Path,
+    deb_url: Optional[str] = None,
 ) -> bool:
     if not shutil.which("dpkg-deb"):
         return False
-    deb_url = build_deb_url(driver_version)
-    if not url_exists(deb_url):
+    url = deb_url or build_deb_url(pkg_version)
+    if not deb_url and not url_exists(url):
         return False
-    deb_path = work_dir / f"libnvidia-ngx1_{driver_version}.deb"
-    extract_dir = work_dir / "deb_extracted"
-    log(f"downloading lightweight NGX package ({deb_url})...")
-    if not download_file(deb_url, deb_path, timeout=120):
+    deb_path = work_dir / f"libnvidia-ngx1_{pkg_version}.deb"
+    extract_dir = work_dir / f"deb_extracted_{pkg_version}"
+    if extract_dir.exists():
+        shutil.rmtree(extract_dir, ignore_errors=True)
+    log(f"downloading lightweight NGX package ({url})...")
+    if not download_file(url, deb_path, timeout=120):
         return False
     rc = subprocess.run(
         ["dpkg-deb", "-x", str(deb_path), str(extract_dir)],
         check=False,
     ).returncode
+    deb_path.unlink(missing_ok=True)
     if rc != 0:
         return False
+    if dest_lib_dir.exists():
+        shutil.rmtree(dest_lib_dir, ignore_errors=True)
     copied = stage_extracted_files(
         extract_dir,
         dest_lib_dir,
         host_sonames=host_sonames,
-        driver_version=driver_version,
+        driver_version=pkg_version,
         recursive_x86_64=True,
     )
+    shutil.rmtree(extract_dir, ignore_errors=True)
     return any(name.startswith("libnvidia-ngx.so") for name in copied)
 
 
@@ -663,6 +790,8 @@ def bootstrap_from_run(
         warn(f"failed to extract NVIDIA driver installer (rc={rc})")
         return False
 
+    if dest_lib_dir.exists():
+        shutil.rmtree(dest_lib_dir, ignore_errors=True)
     copied = stage_extracted_files(
         extract_dir,
         dest_lib_dir,
@@ -693,11 +822,11 @@ def main() -> int:
 
     ok, detail = probe_ngx_load_in_subprocess()
     if ok:
-        log(f"host runtime already provides libnvidia-ngx.so.1 (driver {driver_version})")
+        log(f"host runtime already provides usable libnvidia-ngx.so.1 ({detail}, driver {driver_version})")
         return 0
 
     print("STAGE: Ensuring NVIDIA NGX runtime", flush=True)
-    log(f"libnvidia-ngx.so.1 missing ({detail}); bootstrapping for driver {driver_version}")
+    log(f"libnvidia-ngx.so.1 unusable ({detail}); bootstrapping for driver {driver_version}")
 
     opt_root = Path(os.environ.get("NGX_OPT_DIR", str(DEFAULT_OPT_ROOT)))
     cache_dir = Path(os.environ.get("NGX_CACHE_DIR", str(DEFAULT_CACHE_DIR)))
@@ -735,19 +864,30 @@ def main() -> int:
         warn(f"migrated NGX libraries failed verification ({detail}); falling back to download")
         shutil.rmtree(dest_lib_dir, ignore_errors=True)
 
-    # 3. Cascading download (.deb -> .run) in /tmp with guaranteed cleanup
+    # 3. Cascading download (.deb candidates -> .run) in /tmp with guaranteed cleanup
     work_dir = Path(tempfile.mkdtemp(prefix="ngx-bootstrap-", dir="/tmp"))
     try:
         staged = False
-        if bootstrap_from_deb(driver_version, dest_lib_dir, host_sonames, work_dir):
-            register_ld_conf(dest_lib_dir)
-            maybe_register_graphics_icds(dest_lib_dir)
-            ok, detail = probe_ngx_load_in_subprocess()
-            if ok:
-                staged = True
-                log(f"verified lightweight .deb NGX runtime for driver {driver_version}")
-            else:
-                log(f"lightweight .deb NGX probe failed ({detail}); trying full .run userspace package")
+        deb_candidates = fetch_debian12_ngx_candidates(driver_version)
+        for pkg_version, deb_url in deb_candidates:
+            if bootstrap_from_deb(
+                pkg_version,
+                dest_lib_dir,
+                host_sonames,
+                work_dir,
+                deb_url=deb_url,
+            ):
+                register_ld_conf(dest_lib_dir)
+                maybe_register_graphics_icds(dest_lib_dir)
+                ok, detail = probe_ngx_load_in_subprocess()
+                if ok:
+                    staged = True
+                    log(
+                        f"verified .deb NGX runtime {pkg_version} for host driver "
+                        f"{driver_version} ({detail})"
+                    )
+                    break
+                log(f".deb NGX candidate {pkg_version} failed probe ({detail}); trying next candidate")
                 shutil.rmtree(dest_lib_dir, ignore_errors=True)
 
         if not staged and bootstrap_from_run(driver_version, dest_lib_dir, host_sonames, work_dir):
@@ -756,7 +896,7 @@ def main() -> int:
             ok, detail = probe_ngx_load_in_subprocess()
             if ok:
                 staged = True
-                log(f"verified NGX runtime for driver {driver_version}")
+                log(f"verified NGX runtime for driver {driver_version} ({detail})")
             else:
                 warn(f"NGX runtime staged for driver {driver_version}, but verification failed: {detail}")
 
