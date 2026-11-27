@@ -118,10 +118,14 @@ for dir in /Comfy/custom_nodes/*; do \
 done
 
 # Keep a constraints file with the image's known-good runtime foundation so
-# node installs cannot silently replace CUDA/Torch-adjacent wheels later.
+# node installs and backup restores cannot silently downgrade CUDA/Torch-adjacent
+# wheels or ComfyUI core dependencies later.
 RUN mkdir -p /etc/pip && \
     python3 - <<'PY' > /etc/pip/constraints.txt
 from importlib import metadata
+from pathlib import Path
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
 locked = [
     "torch",
@@ -131,6 +135,7 @@ locked = [
     "onnxruntime-gpu",
     "torchcodec",
 ]
+seen = set()
 
 for name in locked:
     try:
@@ -138,6 +143,30 @@ for name in locked:
     except metadata.PackageNotFoundError:
         continue
     print(f"{name}=={version}")
+    seen.add(canonicalize_name(name))
+
+req_file = Path("/Comfy/requirements.txt")
+if req_file.is_file():
+    for raw in req_file.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith("-"):
+            continue
+        try:
+            req = Requirement(line)
+        except Exception:
+            continue
+        if req.marker and not req.marker.evaluate():
+            continue
+        norm = canonicalize_name(req.name)
+        if norm in seen:
+            continue
+        try:
+            version = metadata.version(req.name)
+        except metadata.PackageNotFoundError:
+            continue
+        base_ver = version.split("+", 1)[0]
+        print(f"{req.name}>={base_ver}")
+        seen.add(norm)
 PY
 
 RUN set -e; \

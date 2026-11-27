@@ -3001,6 +3001,10 @@ if [[ "${RESTORE_BACKUP:-0}" == "1" && -n "${COMFYUI_BACKUP:-}" && -d "/workspac
       rm -f /workspace/ComfyUI/user/*/ComfyUI-Manager/startup-scripts/restore-snapshot.* \
             /workspace/ComfyUI/user/__manager/startup-scripts/restore-snapshot.* 2>/dev/null || true
       echo "[restore] custom nodes restore complete"
+      if [[ -f /workspace/ComfyUI/requirements.txt ]]; then
+        echo "[restore] verifying ComfyUI core requirements after backup node restore..."
+        install_comfyui_core_requirements "$VIRTUAL_ENV/bin/python" /workspace/ComfyUI/requirements.txt || true
+      fi
     else
       echo "[restore][error] custom nodes restore failed; will retry on next boot"
     fi
@@ -3554,15 +3558,32 @@ launch_comfyui_runtime() {
         ;;
     esac
   fi
+  local comfy_start_ts comfy_rc=0
+  comfy_start_ts="$(date +%s)"
   if [[ -n "$pin_cores" ]] && command -v taskset >/dev/null 2>&1; then
     if taskset -c "$pin_cores" true >/dev/null 2>&1; then
       echo "[cpu] Applying CPU affinity mask: $pin_cores"
       PIP_NO_COMPILE=1 COMFYUI_ALLOWED_HOSTS="*" COMFYUI_CORS_ALLOWED_ORIGINS="*" taskset -c "$pin_cores" "$VIRTUAL_ENV/bin/python" main.py "${comfy_args[@]}"
-      return $?
+      comfy_rc=$?
+    else
+      echo "[cpu][warn] Invalid CPU affinity mask '$pin_cores'; launching without taskset."
+      PIP_NO_COMPILE=1 COMFYUI_ALLOWED_HOSTS="*" COMFYUI_CORS_ALLOWED_ORIGINS="*" "$VIRTUAL_ENV/bin/python" main.py "${comfy_args[@]}"
+      comfy_rc=$?
     fi
-    echo "[cpu][warn] Invalid CPU affinity mask '$pin_cores'; launching without taskset."
+  else
+    PIP_NO_COMPILE=1 COMFYUI_ALLOWED_HOSTS="*" COMFYUI_CORS_ALLOWED_ORIGINS="*" "$VIRTUAL_ENV/bin/python" main.py "${comfy_args[@]}"
+    comfy_rc=$?
   fi
-  PIP_NO_COMPILE=1 COMFYUI_ALLOWED_HOSTS="*" COMFYUI_CORS_ALLOWED_ORIGINS="*" "$VIRTUAL_ENV/bin/python" main.py "${comfy_args[@]}"
+
+  local comfy_elapsed=$(( $(date +%s) - comfy_start_ts ))
+  if (( comfy_rc != 0 && comfy_elapsed < 30 )) && [[ ! -f /tmp/.comfy_core_repaired_once ]] && [[ -f /workspace/ComfyUI/requirements.txt ]]; then
+    if tail -n 60 /server.log /workspace/ComfyUI/user/comfyui.log 2>/dev/null | grep -qE "ImportError:|ModuleNotFoundError:"; then
+      touch /tmp/.comfy_core_repaired_once
+      echo "[comfyui][heal] ComfyUI exited early (rc=$comfy_rc, ${comfy_elapsed}s) with ImportError/ModuleNotFoundError; repairing core requirements once..."
+      install_comfyui_core_requirements "$VIRTUAL_ENV/bin/python" /workspace/ComfyUI/requirements.txt || true
+    fi
+  fi
+  return "$comfy_rc"
 }
 
 launch_fizgig_runtime() {
@@ -3598,6 +3619,7 @@ export -f stop_placeholder_process
 export -f uv_link_mode_for_python
 export -f pip_install
 export -f pip_install_requirements
+export -f install_comfyui_core_requirements
 export -f prepare_fizgig_runtime
 export -f configure_cpu_thread_limits
 export -f ensure_empty_default_workflow
