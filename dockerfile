@@ -1,13 +1,50 @@
-FROM runpod/comfyui:cuda13.0
-
-ARG CUDA="130"
-ARG PYTORCH=2.13.0
+FROM runpod/comfyui:2.5.0-comfyuiv0.45.0-cuda13.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=Europe/London \
     PYTHONUNBUFFERED=1 \
     SHELL=/bin/bash \
     NVIDIA_DRIVER_CAPABILITIES=all
+
+# Drop unused RunPod baked ComfyUI copy and auth proxy (~500 MB) — we manage /Comfy & nginx directly
+RUN rm -rf /opt/comfyui-baked /opt/comfyui-auth-proxy
+
+# Initialize /etc/pip/constraints.txt BEFORE any pip install so nothing can alter the CUDA/Torch/SageAttention foundation
+RUN mkdir -p /etc/pip && \
+    python3 - <<'PY' > /etc/pip/constraints.txt
+from importlib import metadata
+from pathlib import Path
+
+lines = []
+seen = set()
+runtime_constraints = Path("/opt/comfyui-runtime-constraints.txt")
+if runtime_constraints.is_file():
+    for raw in runtime_constraints.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line and "==" in line:
+            pkg = line.split("==", 1)[0].strip().lower()
+            lines.append(line)
+            seen.add(pkg)
+
+for pkg in ("torch", "torchvision", "torchaudio", "bitsandbytes", "onnxruntime-gpu", "torchcodec", "sageattention"):
+    if pkg in seen:
+        continue
+    try:
+        ver = metadata.version(pkg)
+    except metadata.PackageNotFoundError:
+        continue
+    lines.append(f"{pkg}=={ver}")
+    seen.add(pkg)
+
+print("\n".join(lines))
+PY
+
+ENV PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu130" \
+    UV_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu130" \
+    PIP_CONSTRAINT="/etc/pip/constraints.txt" \
+    PIP_BUILD_CONSTRAINT="/etc/pip/constraints.txt" \
+    UV_CONSTRAINT="/etc/pip/constraints.txt" \
+    UV_BUILD_CONSTRAINT="/etc/pip/constraints.txt"
 
 # Install system dependencies (extra EGL/OpenGL/Vulkan libraries & utilities missing in base image)
 RUN apt update && apt install -y --no-install-recommends \
@@ -59,7 +96,7 @@ RUN apt update && apt install -y --no-install-recommends \
     fontconfig \
  && rm -rf /var/lib/apt/lists/*
 
-# Install uv (faster installer) & JupyterLab
+# Install uv (removed in base image) & ensure JupyterLab widgets/ipykernel
 RUN pip install --no-cache-dir \
     uv \
     jupyterlab \
@@ -68,12 +105,14 @@ RUN pip install --no-cache-dir \
     ipywidgets && \
     python3 -m ipykernel install --name "python3" --display-name "Python 3"
 
-# Install FileBrowser
-RUN curl -fsSL https://raw.githubusercontent.com/filebrowser/get/master/get.sh | bash
+# Preserve base image's patched FileBrowser if present; otherwise install it
+RUN if ! command -v filebrowser >/dev/null 2>&1; then \
+        curl -fsSL https://raw.githubusercontent.com/filebrowser/get/master/get.sh | bash; \
+    fi
 
 # Ensure python symlink exists for python3
 RUN ln -sf $(which python3) /usr/local/bin/python || true
-    
+
 # Set up ComfyUI
 RUN mkdir -p /Comfy
 WORKDIR /Comfy
@@ -101,8 +140,14 @@ RUN pip install --no-cache-dir -r requirements.txt && \
         packaging \
         pyyaml \
         torchcodec \
-        ninja \
-        comfyui-manager
+        ninja && \
+    pip install --no-cache-dir --upgrade comfyui-manager && \
+    pip install --no-cache-dir --upgrade --force-reinstall --no-deps comfyui-manager && \
+    MANAGER_UTIL="$(python3 -c 'import importlib.util, os; spec = importlib.util.find_spec("comfyui_manager"); print(os.path.join(os.path.dirname(spec.origin), "common", "manager_util.py") if spec and spec.origin else "")')" && \
+    if [ -n "$MANAGER_UTIL" ] && [ -f "$MANAGER_UTIL" ]; then \
+        sed -i 's/timeout=5)/timeout=30)/g' "$MANAGER_UTIL" && \
+        python3 -m compileall -q "$MANAGER_UTIL"; \
+    fi
 
 # Clone and install custom nodes
 ENV CUSTOM_NODES="jnxmx/ComfyUI_HuggingFace_Downloader kijai/ComfyUI-KJNodes Fannovel16/comfyui_controlnet_aux Kosinkadink/ComfyUI-VideoHelperSuite willmiao/ComfyUI-Lora-Manager city96/ComfyUI-GGUF Fannovel16/ComfyUI-Frame-Interpolation lquesada/ComfyUI-Inpaint-CropAndStitch ssitu/ComfyUI_UltimateSDUpscale Comfy-Org/ComfyUI-Manager Comfy-Org/ComfyUI_Nvidia_VFX_Nodes jnxmx/ComfyUI-RunPod-Control xmarre/ComfyUI-Spectrum-MiniMax-H3"
@@ -122,14 +167,12 @@ for dir in /Comfy/custom_nodes/*; do \
     fi; \
 done
 
-# Keep a constraints file with the image's known-good runtime foundation so
-# node installs and backup restores cannot silently downgrade CUDA/Torch-adjacent
-# wheels or ComfyUI core dependencies later.
+# Lock ONLY the binary CUDA/Torch/SageAttention foundation in /etc/pip/constraints.txt
+# (leave ComfyUI frontend/templates unconstrained so ComfyUI updates stay clean) and
+# verify at build time that nothing drifted from the base runtime stack.
 RUN mkdir -p /etc/pip && \
     python3 - <<'PY' > /etc/pip/constraints.txt
 from importlib import metadata
-from pathlib import Path
-from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
 locked = [
@@ -139,6 +182,7 @@ locked = [
     "bitsandbytes",
     "onnxruntime-gpu",
     "torchcodec",
+    "sageattention",
 ]
 seen = set()
 
@@ -149,29 +193,25 @@ for name in locked:
         continue
     print(f"{name}=={version}")
     seen.add(canonicalize_name(name))
+PY
+RUN python3 - <<'PY'
+from importlib import metadata
+from pathlib import Path
 
-req_file = Path("/Comfy/requirements.txt")
-if req_file.is_file():
-    for raw in req_file.read_text(encoding="utf-8").splitlines():
+runtime_file = Path("/opt/comfyui-runtime-constraints.txt")
+if runtime_file.is_file():
+    for raw in runtime_file.read_text(encoding="utf-8").splitlines():
         line = raw.split("#", 1)[0].strip()
-        if not line or line.startswith("-"):
-            continue
-        try:
-            req = Requirement(line)
-        except Exception:
-            continue
-        if req.marker and not req.marker.evaluate():
-            continue
-        norm = canonicalize_name(req.name)
-        if norm in seen:
-            continue
-        try:
-            version = metadata.version(req.name)
-        except metadata.PackageNotFoundError:
-            continue
-        base_ver = version.split("+", 1)[0]
-        print(f"{req.name}>={base_ver}")
-        seen.add(norm)
+        if line and "==" in line:
+            pkg, exp = [x.strip() for x in line.split("==", 1)]
+            got = metadata.version(pkg)
+            assert got == exp, f"{pkg} drifted during build: expected {exp}, got {got}"
+
+sage_ver = metadata.version("sageattention")
+sage_reqs = metadata.requires("sageattention") or []
+torch_pin = f"torch=={metadata.version('torch')}"
+assert torch_pin in sage_reqs, f"sageattention {sage_ver} requires {sage_reqs}, expected {torch_pin}"
+print(f"[build] verified CUDA foundation: {torch_pin}, sageattention=={sage_ver}")
 PY
 
 RUN set -e; \
@@ -189,14 +229,6 @@ RUN set -e; \
     echo "ComfyUI-Manager cm-cli not available at build time; skipping snapshot-list prefetch."; \
   fi
 
-# Clone node from Codeberg
-#RUN git clone --depth=1 https://codeberg.org/Gourieff/comfyui-reactor-node.git /Comfy/custom_nodes/comfyui-reactor-node && \
-#    if [ -f "/Comfy/custom_nodes/comfyui-reactor-node/requirements.txt" ]; then \
-#    pip install --no-cache-dir -r /Comfy/custom_nodes/comfyui-reactor-node/requirements.txt; \
-#    fi 
-    #&& \
-    #mv /Comfy/custom_nodes/comfyui-reactor-node /Comfy/custom_nodes/comfyui-reactor-node.disabled
-
 # Copy configuration and scripts
 COPY 502.html /usr/share/nginx/html/502.html
 COPY assets/ /usr/share/nginx/html/assets/
@@ -205,12 +237,10 @@ COPY config.ini /Comfy/user/__manager/config.ini
 COPY config.ini /config.ini
 COPY comfy.settings.json /Comfy/user/default/comfy.settings.json
 COPY scripts/ /scripts/
-COPY wheels/ /wheels/
 COPY custom_nodes/ComfyUI-Web-Terminal /Comfy/custom_nodes/ComfyUI-Web-Terminal
 COPY start.sh /start.sh
 RUN dos2unix /start.sh && chmod +x /start.sh \
  && find /scripts -type f -name "*.sh" -exec dos2unix {} \; -exec chmod +x {} \;
-
 
 WORKDIR /workspace
 
@@ -232,4 +262,4 @@ ENV HF_HOME="/workspace/.cache/huggingface" \
     NIGHTLY_COMFYUI=0 \
     ENSURE_NVIDIA_NGX=1
 
-CMD ["/start.sh"]
+ENTRYPOINT ["/start.sh"]

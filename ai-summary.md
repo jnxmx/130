@@ -81,10 +81,10 @@ The template includes multiple defensive hooks designed to mitigate common failu
 +-----------------------------------+-----------------------------------------------+
 | Problem / Failure Mode            | Automated Resolve Hook                        |
 +-----------------------------------+-----------------------------------------------+
-| Broken Host CUDA Driver / PyTorch | cuda_probe_json (6-attempt preflight probe)   |
+| Broken Host CUDA Driver / PyTorch | `setup_cuda_compat` + `cuda_probe_json`       |
 | Degraded Host / CPU Steal (>95%)  | check_cpu_overload + taskset affinity pin     |
-| Custom Node Dependency Overwrite  | /etc/pip/constraints.txt (Package Locking)    |
-| GPU Arch Incompatibility (SageAttn)| Capability Probe -> SM86 / SM89 / SM120 Whl   |
+| Custom Node Dependency Overwrite  | `/etc/pip/constraints.txt` + `PIP_BUILD_CONSTRAINT` |
+| GPU Arch Incompatibility (SageAttn)| Baked multi-arch wheel (SM80/86/89/90a/120) + venv guard |
 | Fizgig Auth & Host Verification   | Runtime Ast/Source Patching in server.py      |
 | Shared Model Folder Duplication   | prefs.json scanning & /workspace/models link  |
 | Proxy CORS & Host Header Rejection| Nginx Dynamic Host/Origin Header Rewriting    |
@@ -115,20 +115,19 @@ The template includes multiple defensive hooks designed to mitigate common failu
   - **Core Pinning (`compute_stable_pin_cores`)**: Calculates a stable core range (e.g., `0-71`) and executes PyTorch processes via `taskset -c` to protect worker threads from erratic core migration.
 
 ### Hook C: Python Dependency Protection (`/etc/pip/constraints.txt`)
-- **Target Files**: [dockerfile](file:///Users/jnx/Documents/GitHub/130/dockerfile) & [start.sh](file:///Users/jnx/Documents/GitHub/130/start.sh#L28-L37)
-- **Problem**: `ComfyUI-Manager` or custom nodes installing their own `requirements.txt` frequently downgrade PyTorch, torchvision, or CUDA libraries, breaking binary C++ extension modules.
+- **Target Files**: [dockerfile](file:///Users/jnx/Documents/GitHub/130/dockerfile) & [start.sh](file:///Users/jnx/Documents/GitHub/130/start.sh#L39-L48)
+- **Problem**: `ComfyUI-Manager` or custom nodes installing their own `requirements.txt` frequently downgrade PyTorch, torchvision, SageAttention, or CUDA libraries, breaking binary C++ extension modules.
 - **Mechanism**:
-  - During Docker build, the exact versions of core packages (`torch`, `torchvision`, `torchaudio`, `bitsandbytes`, `onnxruntime-gpu`, `torchcodec`, `nunchaku`) are frozen into `/etc/pip/constraints.txt`.
-  - At runtime, `PIP_CONSTRAINT`, `UV_CONSTRAINT`, and `UV_BUILD_CONSTRAINT` are exported globally. Any `pip install` or `uv pip` command executed by nodes or managers is forced to respect these pinned limits.
+  - At the very start of the Docker build (before any `pip install`) and again after custom node installation, the exact versions of the binary CUDA foundation (`torch`, `torchvision`, `torchaudio`, `bitsandbytes`, `onnxruntime-gpu`, `torchcodec`, `sageattention`) are locked into `/etc/pip/constraints.txt`.
+  - `PIP_CONSTRAINT`, `PIP_BUILD_CONSTRAINT`, `UV_CONSTRAINT`, and `UV_BUILD_CONSTRAINT` are exported globally so `pip 26.2+` isolated build environments and `uv` both respect these pinned limits.
 
-### Hook D: Hardware-Specific SageAttention Architecture Selector
-- **Target File**: [start.sh](file:///Users/jnx/Documents/GitHub/130/start.sh#L1150-L1208)
-- **Problem**: `SageAttention` requires C++ extensions compiled specifically for the GPU microarchitecture (Ampere, Ada Lovelace, Blackwell). Using a mismatched wheel results in invalid instruction crashes.
+### Hook D: Multi-Architecture SageAttention & CUDA Forward Compatibility
+- **Target Files**: [dockerfile](file:///Users/jnx/Documents/GitHub/130/dockerfile) & [start.sh](file:///Users/jnx/Documents/GitHub/130/start.sh)
+- **Problem**: `SageAttention` requires native SASS kernels compiled for the exact PyTorch/CUDA stack and GPU architecture (`sm_80`/`86`/`89`/`90a`/`120`). Additionally, `cuda-compat-13-0` in the base image can break consumer GeForce GPUs (`cuInit 804`) if auto-activated by the container runtime, while datacenter GPUs need it on older 12.8/12.9 hosts.
 - **Mechanism**:
-  - Queries `torch.cuda.get_device_capability()` at startup.
-  - Maps device capabilities: `86` -> `sm86` (RTX 30xx), `89` -> `sm89` (RTX 40xx), `120` -> `sm120` (RTX 50xx).
-  - Installs the pre-compiled wheel matching the detected architecture from `/wheels/`.
-  - If `MAKE_WHEELS=1` is passed, automatically builds and tags an architecture-specific wheel on boot and saves it to `/workspace/wheels`.
+  - `setup_cuda_compat` probes `cuInit(0)` before CUDA preflight: disables runtime-injected compat on GeForce or up-to-date hosts, and enables `/opt/cuda-compat` only on supported datacenter GPUs running on older host drivers (opt-out via `DISABLE_CUDA_COMPAT=1`).
+  - Uses the pre-baked multi-architecture `SageAttention 2.2.0+torch2.10.0.cu130.sm90fix1` wheel (`SM 8.0 / 8.6 / 8.9 / 9.0a / 12.0`) directly from system `dist-packages` for both ComfyUI and Fizgig.
+  - At startup, `verify_sageattention_runtime` removes any stale venv-local `sageattention` override (e.g. from legacy persisted archives or PyPI `1.x`) and restores links to the image's multi-arch wheel.
 
 ### Hook E: Fizgig Authentication Bypass & Shared Models Integration
 - **Target File**: [start.sh](file:///Users/jnx/Documents/GitHub/130/start.sh)
@@ -213,7 +212,7 @@ Instead of serving generic static 502 pages, the system includes three Python HT
 | `RESTORE_BACKUP` | `0` | Set to `1` to enable automatic model and node restoration on first boot. |
 | `SYNC_IMAGE_BAKED_COMFY_CORE` | `0` | Set to `1` to sync image core updates into persisted `/workspace/ComfyUI`. |
 | `USE_UV` | `0` | Set to `1` to use fast `uv` installer for python packages instead of `pip`. |
-| `MAKE_WHEELS` | `0` | Set to `1` to build `sageattention` architecture wheels on boot if missing. |
+| `DISABLE_CUDA_COMPAT` | `0` | Set to `1` to skip automatic `cuda-compat` setup/cleanup at container boot. |
 | `STUDENT_MODE` | `0` | Disables automated restoration of `comfy_course` default workflows. |
 | `ENABLE_RUNTIME_REPO_UPDATES` | `1` | Automatically updates ComfyUI and custom nodes on startup via git/cli. |
 | `NIGHTLY_COMFYUI` | `0` | Set to `1` to switch ComfyUI core & Manager to nightly builds. Defaults to `0` (latest stable release). |

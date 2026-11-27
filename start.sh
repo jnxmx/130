@@ -41,6 +41,7 @@ if [[ -z "${PIP_CONSTRAINT:-}" && -f "$DEFAULT_PYTHON_CONSTRAINTS" ]]; then
   export PIP_CONSTRAINT="$DEFAULT_PYTHON_CONSTRAINTS"
 fi
 if [[ -n "${PIP_CONSTRAINT:-}" ]]; then
+  export PIP_BUILD_CONSTRAINT="${PIP_BUILD_CONSTRAINT:-$PIP_CONSTRAINT}"
   export UV_CONSTRAINT="${UV_CONSTRAINT:-$PIP_CONSTRAINT}"
   export UV_BUILD_CONSTRAINT="${UV_BUILD_CONSTRAINT:-$PIP_CONSTRAINT}"
   echo "[deps] python install constraints: $PIP_CONSTRAINT"
@@ -140,23 +141,22 @@ install_comfyui_core_requirements() {
     constraint_args=(--constraint "$PIP_CONSTRAINT")
   fi
 
+  # Filter out system CUDA 13 PyTorch/SageAttention stack packages already preinstalled in the image
+  local filtered_req
+  filtered_req="$(mktemp /tmp/comfy_core_req.XXXXXX.txt)"
+  grep -v -E '^\s*(torch|torchvision|torchaudio|nvidia-|triton|sageattention)\b' "$req" > "$filtered_req" || true
+
   local use_uv_core="${RUNTIME_USE_UV:-1}"
   if [[ "$use_uv_core" == "1" ]] && command -v uv >/dev/null 2>&1; then
     local link_mode
     link_mode="$(uv_link_mode_for_python "$py")"
 
-    # Filter out system CUDA 13 PyTorch stack packages already preinstalled in the image
-    local filtered_req
-    filtered_req="$(mktemp /tmp/comfy_core_req.XXXXXX.txt)"
-    grep -v -E '^\s*(torch|torchvision|torchaudio|nvidia-|triton)\b' "$req" > "$filtered_req" || true
-
     # Dry-run guard: ensure uv does not attempt to resolve or change torch/CUDA ecosystem packages
     local dry_run_out=""
     dry_run_out="$(UV_LINK_MODE="$link_mode" UV_CONCURRENT_DOWNLOADS=16 uv pip install --python "$py" "${constraint_args[@]}" --dry-run -r "$filtered_req" 2>&1 || true)"
 
-    if echo "$dry_run_out" | grep -qE '^\s*(\+|\~|\-)\s*(torch|torchvision|torchaudio|nvidia-|triton|onnxruntime|xformers|bitsandbytes|torchcodec)\b'; then
+    if echo "$dry_run_out" | grep -qE '^\s*(\+|\~|\-)\s*(torch|torchvision|torchaudio|nvidia-|triton|onnxruntime|xformers|bitsandbytes|torchcodec|sageattention)\b'; then
       echo "[deps][warn] uv dry-run detected torch/CUDA ecosystem package in plan; falling back to pip to preserve system torch"
-      rm -f "$filtered_req"
     else
       echo "[deps] installing ComfyUI core requirements via uv (parallel downloads, link_mode=$link_mode)..."
       if env UV_LINK_MODE="$link_mode" UV_CONCURRENT_DOWNLOADS=16 UV_EXTRA_INDEX_URL="" PIP_EXTRA_INDEX_URL="" \
@@ -165,13 +165,15 @@ install_comfyui_core_requirements() {
         echo "[deps] ComfyUI core requirements installed via uv."
         return 0
       fi
-      rm -f "$filtered_req"
       echo "[deps][warn] uv install failed; falling back to pip..."
     fi
   fi
 
-  # Fallback: standard pip install without slow PyTorch index for core requirements
-  env PIP_EXTRA_INDEX_URL="" "$py" -m pip install "${constraint_args[@]}" -r "$req" "$@"
+  # Fallback: standard pip install using filtered requirements while keeping PyTorch extra index for constraint resolution
+  local rc=0
+  "$py" -m pip install "${constraint_args[@]}" -r "$filtered_req" "$@" || rc=$?
+  rm -f "$filtered_req"
+  return "$rc"
 }
 
 run_with_manager_pip_env() {
@@ -1054,6 +1056,154 @@ write_comfy_env_init_script || true
 start_comfy_placeholder || true
 ensure_nginx_started || true
 
+# --- CUDA forward compatibility helper (mirrors runpod/comfyui 2.5.0+ logic) ---
+CUDA_COMPAT_DIR="${CUDA_COMPAT_DIR:-/opt/cuda-compat}"
+CUDA_COMPAT_STATUS="not installed"
+
+probe_libcuda() {
+  python3 - <<'PY' 2>/dev/null || echo "0 -1 none"
+import ctypes
+try:
+    lib = ctypes.CDLL("libcuda.so.1")
+except OSError:
+    print("0 -1 none")
+    raise SystemExit
+version = ctypes.c_int(0)
+lib.cuDriverGetVersion(ctypes.byref(version))
+rc = lib.cuInit(0)
+path = "unknown"
+with open("/proc/self/maps", "r", encoding="utf-8", errors="ignore") as maps:
+    for line in maps:
+        if "libcuda.so" in line:
+            path = line.split()[-1]
+            break
+print(version.value, rc, path)
+PY
+}
+
+drop_runtime_cuda_compat() {
+  local conf
+  for conf in /etc/ld.so.conf.d/*.conf; do
+    [[ -f "$conf" ]] || continue
+    if grep -qE '^[[:space:]]*/usr/local/cuda[^/]*/compat/?[[:space:]]*$' "$conf"; then
+      mv "$conf" "$conf.disabled-by-start-sh" 2>/dev/null || true
+    fi
+  done
+  ldconfig 2>/dev/null || true
+}
+
+image_cuda_version() {
+  python3 - <<'PY' 2>/dev/null || echo 0
+import json
+import re
+import subprocess
+try:
+    with open("/usr/local/cuda/version.json", "r", encoding="utf-8") as f:
+        major, minor = json.load(f)["cuda"]["version"].split(".")[:2]
+except Exception:
+    out = subprocess.run(["/usr/local/cuda/bin/nvcc", "--version"], capture_output=True, text=True).stdout
+    m = re.search(r"release (\d+)\.(\d+)", out or "")
+    if not m:
+        print(0)
+        raise SystemExit
+    major, minor = m.groups()
+print(int(major) * 1000 + int(minor) * 10)
+PY
+}
+
+find_host_libcuda_dir() {
+  local lib
+  while IFS= read -r lib; do
+    [[ -z "$lib" || "$lib" == */compat/* ]] && continue
+    if [[ -e "$lib" ]]; then
+      dirname "$lib"
+      return 0
+    fi
+  done < <(
+    { ldconfig -p 2>/dev/null | awk '$1 == "libcuda.so.1" {print $NF}'; printf '%s\n' /usr/lib/x86_64-linux-gnu/libcuda.so.1 /usr/lib64/libcuda.so.1; }
+  )
+}
+
+setup_cuda_compat() {
+  if [[ ! -e "$CUDA_COMPAT_DIR/libcuda.so.1" ]]; then
+    return 0
+  fi
+
+  local host_ver=0 host_rc=-1 host_path=none
+  local compat_ver=0 compat_rc=-1 compat_path=none
+  local runtime_note="" host_dir="" override_ver=0 override_rc=-1 override_path=none image_ver=0 opted_out=0
+
+  IFS=' ' read -r host_ver host_rc host_path <<< "$(probe_libcuda)"
+
+  if [[ "${DISABLE_CUDA_COMPAT:-0}" == "1" ]]; then
+    opted_out=1
+    if [[ "$host_path" == */compat/* && "${host_rc:--1}" != "0" ]]; then
+      CUDA_COMPAT_STATUS="UNAVAILABLE (DISABLE_CUDA_COMPAT=1 left compat enabled by container runtime: $host_path, cuInit=$host_rc)"
+    elif [[ "$host_path" == */compat/* ]]; then
+      CUDA_COMPAT_STATUS="disabled (DISABLE_CUDA_COMPAT=1); runtime compat kept (CUDA $host_ver via $host_path)"
+    else
+      CUDA_COMPAT_STATUS="disabled (DISABLE_CUDA_COMPAT=1)"
+    fi
+  else
+    if [[ "$host_path" == */compat/* ]]; then
+      drop_runtime_cuda_compat
+      runtime_note="; removed runtime-enabled compat (cuInit=$host_rc)"
+      IFS=' ' read -r host_ver host_rc host_path <<< "$(probe_libcuda)"
+    fi
+
+    if [[ "$host_path" == */compat/* ]]; then
+      host_dir="$(find_host_libcuda_dir || true)"
+      if [[ -n "$host_dir" ]]; then
+        IFS=' ' read -r override_ver override_rc override_path <<< "$(LD_LIBRARY_PATH="$host_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" probe_libcuda)"
+        if [[ "${override_path:-none}" != "none" && "$override_path" != */compat/* ]]; then
+          export LD_LIBRARY_PATH="$host_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          runtime_note="; overrode runtime compat via LD_LIBRARY_PATH=$host_dir"
+          host_ver="$override_ver"
+          host_rc="$override_rc"
+          host_path="$override_path"
+        fi
+      fi
+    fi
+
+    IFS=' ' read -r compat_ver compat_rc compat_path <<< "$(LD_LIBRARY_PATH="$CUDA_COMPAT_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" probe_libcuda)"
+  fi
+
+  if [[ "$opted_out" == "1" ]]; then
+    :
+  elif [[ "${host_path:-none}" == "none" ]]; then
+    CUDA_COMPAT_STATUS="skipped (no host NVIDIA driver visible)$runtime_note"
+  elif [[ "$host_path" == */compat/* ]]; then
+    if [[ "${host_rc:--1}" == "0" ]]; then
+      CUDA_COMPAT_STATUS="ENABLED by container runtime (CUDA $host_ver via $host_path)"
+    else
+      CUDA_COMPAT_STATUS="UNAVAILABLE (runtime compat $host_path failed cuInit=$host_rc)"
+    fi
+  elif (( ${compat_ver:-0} <= 0 )); then
+    image_ver="$(image_cuda_version)"
+    if (( ${image_ver:-0} > 0 && ${host_ver:-0} >= image_ver )); then
+      CUDA_COMPAT_STATUS="not needed (host driver supports CUDA $host_ver)$runtime_note"
+    else
+      CUDA_COMPAT_STATUS="UNAVAILABLE (compat did not load; host CUDA $host_ver, image CUDA ${image_ver:-unknown})$runtime_note"
+    fi
+  elif (( ${host_ver:-0} >= ${compat_ver:-0} )); then
+    CUDA_COMPAT_STATUS="not needed (host driver supports CUDA $host_ver)$runtime_note"
+  elif [[ "${compat_rc:--1}" == "0" && "$compat_path" != "$host_path" ]]; then
+    export LD_LIBRARY_PATH="$CUDA_COMPAT_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    CUDA_COMPAT_STATUS="ENABLED (host driver CUDA $host_ver -> CUDA $compat_ver via $compat_path)"
+  else
+    local reason="cuInit returned $compat_rc"
+    case "$compat_rc" in
+      804) reason="this GPU does not support CUDA forward compatibility (GeForce cards are not supported)" ;;
+      803) reason="host driver branch is not supported by bundled compat driver" ;;
+    esac
+    CUDA_COMPAT_STATUS="UNAVAILABLE (host driver CUDA $host_ver < image CUDA $compat_ver; $reason)$runtime_note"
+  fi
+
+  echo "[cuda] CUDA forward compat: $CUDA_COMPAT_STATUS"
+}
+
+setup_cuda_compat || true
+
 # --- CUDA preflight (bail early) ---
 echo "STAGE: Checking CUDA initialization"
 CUDA_PREFLIGHT_ATTEMPTS="${CUDA_PREFLIGHT_ATTEMPTS:-6}"
@@ -1435,7 +1585,7 @@ if not sys_site:
 
 patterns = [
     "torch", "torch-*.dist-info", "torchgen*", "functorch*",
-    "torchvision*", "torchaudio*", "torchcodec*",
+    "torchvision*", "torchaudio*", "torchcodec*", "sageattention*",
     "nvidia*", "triton*", "cuda*", "cublas*", "cudnn*", "caffe2*",
     "filelock*", "fsspec*", "jinja2*", "networkx*", "sympy*", "typing_extensions*", "mpmath*"
 ]
@@ -1559,7 +1709,7 @@ PY
       export UV_LINK_MODE="copy"
 
       local install_ok=0
-      if env -u UV_EXTRA_INDEX_URL -u PIP_EXTRA_INDEX_URL UV_CONSTRAINT="${fizgig_constraint:-}" UV_BUILD_CONSTRAINT="${fizgig_constraint:-}" PIP_CONSTRAINT="${fizgig_constraint:-}" DISABLE_CUDA=1 \
+      if env -u UV_EXTRA_INDEX_URL -u PIP_EXTRA_INDEX_URL UV_CONSTRAINT="${fizgig_constraint:-}" UV_BUILD_CONSTRAINT="${fizgig_constraint:-}" PIP_CONSTRAINT="${fizgig_constraint:-}" PIP_BUILD_CONSTRAINT="${fizgig_constraint:-}" DISABLE_CUDA=1 \
           "$FIZGIG_VENV/bin/python" -m uv pip install \
             --link-mode=copy \
             --index-strategy unsafe-best-match \
@@ -1569,7 +1719,7 @@ PY
         install_ok=1
       else
         echo "[fizgig][warn] uv pip install failed, attempting pip fallback..." >> /fizgig_setup.log
-        if env -u UV_EXTRA_INDEX_URL -u PIP_EXTRA_INDEX_URL PIP_CONSTRAINT="${fizgig_constraint:-}" DISABLE_CUDA=1 \
+        if env -u UV_EXTRA_INDEX_URL PIP_CONSTRAINT="${fizgig_constraint:-}" PIP_BUILD_CONSTRAINT="${fizgig_constraint:-}" DISABLE_CUDA=1 \
           "$FIZGIG_VENV/bin/python" -m pip install \
             --no-build-isolation \
             "${constraint_args[@]}" \
@@ -1920,6 +2070,7 @@ required = [
     "onnxruntime_gpu",
     "torchcodec",
     "nunchaku",
+    "sageattention",
 ]
 
 existing = []
@@ -2002,6 +2153,7 @@ protected = {
     "onnxruntime_gpu",
     "torchcodec",
     "nunchaku",
+    "sageattention",
 }
 
 pattern = re.compile(r"^\s*([A-Za-z0-9_.-]+)")
@@ -2592,220 +2744,118 @@ ensure_nvidia_ngx_runtime() {
 
 ensure_nvidia_ngx_runtime
 
-# --- Install/build sageattention based on GPU architecture ---
-SAGEATTENTION_VERSION="2.2.0"
-SAGE_WHEEL_OUTPUT_DIR="/workspace/wheels"
-ARCH=$(python3 - <<'EOF' || echo "none"
-import torch
-if not torch.cuda.is_available():
-    print("none")
-    exit(0)
-cap = torch.cuda.get_device_capability()[0] * 10 + torch.cuda.get_device_capability()[1]
-arch_map = {120: "sm120", 86: "sm86", 89: "sm89"}
-print(arch_map.get(cap, "none"))
-EOF
-)
+# --- Verify pre-baked multi-arch SageAttention & clean up stale venv overrides ---
+verify_sageattention_runtime() {
+  local venv_dir="${1:-$VIRTUAL_ENV}"
+  local py="$venv_dir/bin/python"
+  [[ -x "$py" ]] || return 0
 
-# Helper: download SageAttention source into a directory
-# Usage: _sage_fetch_source <dest_dir>
-_sage_fetch_source() {
-  local DEST="$1"
-  echo "Fetching SageAttention source repository..."
+  "$py" - "$venv_dir" <<'PY' || true
+import importlib.metadata as md
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
 
-  # Method 1: Direct git clone
-  if GIT_TERMINAL_PROMPT=0 git clone --depth 1 https://github.com/thu-ml/SageAttention.git "$DEST" 2>/dev/null; then
-    echo "Successfully cloned SageAttention via git"
-    return 0
-  fi
+venv_dir = Path(sys.argv[1])
+venv_site = next((d for d in sorted(venv_dir.glob("lib/python*/site-packages")) if d.is_dir()), None)
+if not venv_site:
+    raise SystemExit(0)
 
-  echo "[WARN] git clone failed, falling back to HTTPS archive download"
+sys_site = None
+for cand in (
+    f"/usr/local/lib/python{sys.version_info.major}.{sys.version_info.minor}/dist-packages",
+    "/usr/local/lib/python3.12/dist-packages",
+    "/usr/lib/python3/dist-packages",
+):
+    if os.path.isdir(os.path.join(cand, "sageattention")):
+        sys_site = Path(cand)
+        break
 
-  # Method 2: Codeload tarball download
-  rm -rf "${DEST:?}"/*
-  local TGZ
-  TGZ=$(mktemp /tmp/sageattention-XXXXXX.tar.gz)
-  local URL="https://codeload.github.com/thu-ml/SageAttention/tar.gz/refs/heads/main"
-  if curl -fsSL --max-time 300 -o "$TGZ" "$URL" && gzip -t "$TGZ" 2>/dev/null; then
-    tar -xz -C "$DEST" --strip-components=1 -f "$TGZ"
-    rm -f "$TGZ"
-    echo "Successfully downloaded SageAttention via codeload tarball"
-    return 0
-  fi
-  rm -f "$TGZ"
+def _find_dist(site_dir: Path):
+    for dist in md.distributions(path=[str(site_dir)]):
+        name = re.sub(r"[-_.]+", "-", dist.metadata.get("Name") or "").lower()
+        if name == "sageattention":
+            return dist
+    return None
 
-  # Method 3: GitHub archive tarball download
-  rm -rf "${DEST:?}"/*
-  TGZ=$(mktemp /tmp/sageattention-XXXXXX.tar.gz)
-  URL="https://github.com/thu-ml/SageAttention/archive/refs/heads/main.tar.gz"
-  if curl -fsSL --max-time 300 -L -o "$TGZ" "$URL" && gzip -t "$TGZ" 2>/dev/null; then
-    tar -xz -C "$DEST" --strip-components=1 -f "$TGZ"
-    rm -f "$TGZ"
-    echo "Successfully downloaded SageAttention via github archive tarball"
-    return 0
-  fi
-  rm -f "$TGZ"
+def _seed_dir_symlinks(src_dir: Path, dst_dir: Path) -> None:
+    if dst_dir.is_symlink() or dst_dir.is_file():
+        dst_dir.unlink(missing_ok=True)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for entry in os.scandir(src_dir):
+        if entry.name == "__pycache__":
+            continue
+        dst_entry = dst_dir / entry.name
+        if entry.is_dir(follow_symlinks=True):
+            _seed_dir_symlinks(Path(entry.path), dst_entry)
+        elif not dst_entry.exists() and not dst_entry.is_symlink():
+            os.symlink(entry.path, dst_entry)
 
-  echo "[ERROR] All methods to download SageAttention source failed."
-  return 1
-}
+sys_dist = _find_dist(sys_site) if sys_site else None
+venv_dist = _find_dist(venv_site)
+venv_pkg = venv_site / "sageattention"
 
-_sage_patch_and_build_env() {
-  local DEST="$1"
-  local ARCH_TARGET="$2"
-
-  # 1. Setup CUDA_HOME & PATHs based on PyTorch's CUDA version
-  local PYTORCH_CUDA_VER=""
-  PYTORCH_CUDA_VER="$("$VIRTUAL_ENV/bin/python" -c "import torch; print(torch.version.cuda if torch.cuda.is_available() else '')" 2>/dev/null || true)"
-  
-  local DETECTED_CUDA_HOME=""
-  if [[ -n "$PYTORCH_CUDA_VER" && -d "/usr/local/cuda-${PYTORCH_CUDA_VER}" ]]; then
-    DETECTED_CUDA_HOME="/usr/local/cuda-${PYTORCH_CUDA_VER}"
-  elif [[ -d "/usr/local/cuda" ]]; then
-    DETECTED_CUDA_HOME="/usr/local/cuda"
-  elif command -v nvcc >/dev/null 2>&1; then
-    DETECTED_CUDA_HOME="$(dirname "$(dirname "$(which nvcc)")")"
-  fi
-
-  if [[ -n "$DETECTED_CUDA_HOME" ]]; then
-    export CUDA_HOME="$DETECTED_CUDA_HOME"
-    export PATH="$CUDA_HOME/bin:$PATH"
-    export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${CUDA_HOME}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
-    export CFLAGS="-I${CUDA_HOME}/include -I${CUDA_HOME}/targets/x86_64-linux/include ${CFLAGS:-}"
-    export CXXFLAGS="-I${CUDA_HOME}/include -I${CUDA_HOME}/targets/x86_64-linux/include ${CXXFLAGS:-}"
-    echo "[sage] Using CUDA_HOME: $CUDA_HOME"
-  fi
-
-  # 2. Patch source headers and setup.py (from Easy-Install reference scripts)
-  "$VIRTUAL_ENV/bin/python" - "$DEST" <<'PY'
-import os, sys
-
-dest = sys.argv[1]
-print(f"[sage] Patching SageAttention source files in {dest}...")
-
-# Add missing C++ std headers
-patch_files = [
-    os.path.join(dest, 'csrc/fused/fused.cu'),
-    os.path.join(dest, 'csrc/qattn/qk_int_sv_f16_cuda_sm80.cu'),
-    os.path.join(dest, 'csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh'),
-]
-for fpath in patch_files:
-    if os.path.exists(fpath):
-        with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-        if '#include <vector>' not in content:
-            new_content = '#include <vector>\n#include <typeindex>\n' + content
-            with open(fpath, 'w', encoding='utf-8') as f:
-                f.write(new_content)
-            print(f"[sage] Added vector/typeindex headers to {os.path.basename(fpath)}")
-
-# Patch setup.py C++ flags to use std=c++20 & ENABLE_BF16
-setup_path = os.path.join(dest, 'setup.py')
-if os.path.exists(setup_path):
-    with open(setup_path, 'r', encoding='utf-8', errors='ignore') as f:
-        setup_content = f.read()
-    setup_content = setup_content.replace(
-        'CXX_FLAGS = ["/O2", "/openmp"]',
-        'CXX_FLAGS = ["/O2", "/openmp", "-std=c++20", "-DENABLE_BF16"]'
-    )
-    setup_content = setup_content.replace('-std=c++17', '-std=c++20')
-    if '-I/usr/include' not in setup_content:
-        setup_content = setup_content.replace(
-            "'-O3',",
-            "'-O3', '-I/usr/include', '-I/usr/local/cuda/include',"
+# Detect stale local override (e.g. legacy sm86/sm89/sm120 wheel or PyPI 1.x)
+needs_relink = False
+if sys_site and sys_dist:
+    if venv_dist is None or not venv_pkg.exists():
+        needs_relink = True
+    elif venv_dist.version != sys_dist.version:
+        print(
+            f"[sage][heal] Replacing stale venv sageattention {venv_dist.version} "
+            f"with image multi-arch {sys_dist.version}"
         )
-    with open(setup_path, 'w', encoding='utf-8') as f:
-        f.write(setup_content)
-    print("[sage] Patched setup.py flags to C++20")
+        needs_relink = True
+    else:
+        # Even if version string matches, ensure files link to sys_site rather than stale copies
+        has_real_so = any(
+            p.name.endswith(".so") and not p.is_symlink()
+            for p in venv_pkg.rglob("*.so")
+        )
+        if has_real_so:
+            print(f"[sage][heal] Replacing copied venv sageattention ({venv_dist.version}) with image symlinks")
+            needs_relink = True
+
+if needs_relink and sys_site and sys_dist:
+    for item in list(venv_site.glob("sageattention*")):
+        if item.is_symlink() or item.is_file():
+            item.unlink(missing_ok=True)
+        elif item.is_dir():
+            shutil.rmtree(item, ignore_errors=True)
+    for src_item in sys_site.glob("sageattention*"):
+        dst_item = venv_site / src_item.name
+        if src_item.name.endswith((".dist-info", ".egg-info")):
+            if src_item.is_dir():
+                shutil.copytree(src_item, dst_item, symlinks=True)
+            else:
+                shutil.copy2(src_item, dst_item)
+        elif src_item.is_dir():
+            _seed_dir_symlinks(src_item, dst_item)
+        else:
+            os.symlink(str(src_item), str(dst_item))
+    venv_dist = _find_dist(venv_site)
+
+active_ver = (venv_dist or sys_dist).version if (venv_dist or sys_dist) else "none"
+try:
+    import torch
+    if torch.cuda.is_available():
+        cap_major, cap_minor = torch.cuda.get_device_capability()
+        cap = f"{cap_major}.{cap_minor}"
+        supported = {"8.0", "8.6", "8.9", "9.0", "12.0"}
+        if cap in supported:
+            print(f"[sage] Active SageAttention {active_ver} (GPU SM {cap} supported)")
+        else:
+            print(f"[sage][warn] SageAttention {active_ver} present, but GPU SM {cap} has no native kernels (ComfyUI will fall back if needed)")
+    else:
+        print(f"[sage] Active SageAttention {active_ver} (CUDA unavailable during check)")
+except Exception as exc:
+    print(f"[sage][warn] SageAttention verification note: {exc}")
 PY
-
-  # 3. Environment compilation flags
-  CUDA_ARCH_VER=""
-  case "$ARCH_TARGET" in
-    sm120) CUDA_ARCH_VER="12.0" ;;
-    sm89)  CUDA_ARCH_VER="8.9" ;;
-    sm86)  CUDA_ARCH_VER="8.6" ;;
-    *)     CUDA_ARCH_VER="" ;;
-  esac
-
-  export MAX_JOBS=4
-  export NINJA_MAX_JOBS=4
-  export EXT_PARALLEL=4
-  export NVCC_APPEND_FLAGS="--threads 4"
-  if [[ -n "$CUDA_ARCH_VER" ]]; then
-    export TORCH_CUDA_ARCH_LIST="$CUDA_ARCH_VER"
-  fi
 }
 
-if [[ "${MAKE_WHEELS:-0}" == "1" ]]; then
-  echo "STAGE: Building sageattention wheel(s) (MAKE_WHEELS=1) [$SCRIPT_VERSION]"
-  if [[ "$ARCH" == "none" ]]; then
-    echo "[WARN] No supported GPU architecture detected; skipping sageattention wheel build."
-  else
-    echo "[deps] Ensuring build toolchain (build-essential, python3-dev, CUDA headers) is installed..."
-    apt-get update -qq && (apt-get install -y --no-install-recommends build-essential python3-dev libcublas-dev libcusparse-dev -qq || apt-get install -y --no-install-recommends build-essential python3-dev -qq) 2>/dev/null || true
-    mkdir -p "$SAGE_WHEEL_OUTPUT_DIR" || true
-    TMP_SAGE_BUILD_DIR=$(mktemp -d /tmp/sageattention-src.XXXXXX)
-    TMP_SAGE_WHEEL_DIR=$(mktemp -d /tmp/sageattention-out.XXXXXX)
-    if _sage_fetch_source "$TMP_SAGE_BUILD_DIR"; then
-      echo "Building sageattention wheel for $ARCH in $TMP_SAGE_WHEEL_DIR..."
-      _sage_patch_and_build_env "$TMP_SAGE_BUILD_DIR" "$ARCH" || true
-
-      if "$VIRTUAL_ENV/bin/python" -m pip wheel --no-deps --no-build-isolation --no-cache-dir "$TMP_SAGE_BUILD_DIR" -w "$TMP_SAGE_WHEEL_DIR"; then
-        BUILT_WHEEL=$(find "$TMP_SAGE_WHEEL_DIR" -maxdepth 1 -type f -name "sageattention-*.whl" -print -quit 2>/dev/null || true)
-        if [[ -n "$BUILT_WHEEL" ]]; then
-          BASE_NAME=$(basename "$BUILT_WHEEL")
-          VER_STR=$(echo "$BASE_NAME" | sed -E 's/^sageattention-([^-]+)-.*/\1/' || true)
-          RENAMED_NAME="${BASE_NAME/sageattention-${VER_STR}-/sageattention-${VER_STR}+${ARCH}-}"
-          TARGET_PATH="${SAGE_WHEEL_OUTPUT_DIR}/${RENAMED_NAME}"
-          if mv "$BUILT_WHEEL" "$TARGET_PATH"; then
-            echo "Saved architecture-specific wheel to $TARGET_PATH"
-            echo "Installing sageattention from built wheel"
-            pip_install "$VIRTUAL_ENV/bin/python" --no-deps "$TARGET_PATH" || echo "[sage][warn] Failed to install built sageattention wheel; skipping (optional in modern ComfyUI)."
-          else
-            echo "[sage][warn] Failed to move built wheel to $TARGET_PATH; installing from $BUILT_WHEEL"
-            pip_install "$VIRTUAL_ENV/bin/python" --no-deps "$BUILT_WHEEL" || echo "[sage][warn] Failed to install built sageattention wheel; skipping (optional in modern ComfyUI)."
-          fi
-        else
-          echo "[WARN] Wheel build succeeded but artifact missing; installing from source directly"
-          pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_SAGE_BUILD_DIR" || echo "[sage][warn] Failed to install sageattention from source; skipping (optional in modern ComfyUI)."
-        fi
-      else
-        echo "[WARN] Failed to build sageattention wheel; trying source install directly"
-        pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_SAGE_BUILD_DIR" || echo "[sage][warn] Failed to install sageattention from source; skipping (optional in modern ComfyUI)."
-      fi
-      unset MAX_JOBS NINJA_MAX_JOBS EXT_PARALLEL NVCC_APPEND_FLAGS TORCH_CUDA_ARCH_LIST CUDA_HOME 2>/dev/null || true
-    else
-      echo "[WARN] Failed to download SageAttention source archive; skipping (optional in modern ComfyUI)."
-    fi
-    rm -rf "${TMP_SAGE_BUILD_DIR:-}" "${TMP_SAGE_WHEEL_DIR:-}"
-  fi
-else
-  if [ "$ARCH" != "none" ]; then
-      echo "STAGE: Installing sageattention"
-      WHEEL_FILE=$(find /wheels /workspace/wheels -type f -name "sageattention-*+${ARCH}-*.whl" 2>/dev/null | head -n 1 || true)
-      if [ -n "$WHEEL_FILE" ]; then
-          echo "Installing sageattention wheel for architecture $ARCH"
-          pip_install "$VIRTUAL_ENV/bin/python" --no-deps "$WHEEL_FILE" || echo "[sage][warn] Failed to install sageattention wheel ($WHEEL_FILE); skipping (optional in modern ComfyUI)."
-      else
-          echo "No matching wheel found for architecture $ARCH, downloading and installing from source"
-          if ! dpkg -s libcusparse-dev >/dev/null 2>&1; then
-            echo "Installing libcusparse-dev dependency for CUDA extension compilation..."
-            apt-get update -qq && apt-get install -y --no-install-recommends libcusparse-dev -qq || true
-          fi
-          TMP_CLONE_DIR=$(mktemp -d /tmp/sage-dl.XXXXXX)
-          if _sage_fetch_source "$TMP_CLONE_DIR"; then
-            _sage_patch_and_build_env "$TMP_CLONE_DIR" "$ARCH" || true
-            pip_install "$VIRTUAL_ENV/bin/python" --no-build-isolation "$TMP_CLONE_DIR" || echo "[sage][warn] Failed to build/install sageattention from source for $ARCH; skipping (optional in modern ComfyUI)."
-            unset MAX_JOBS NINJA_MAX_JOBS EXT_PARALLEL NVCC_APPEND_FLAGS TORCH_CUDA_ARCH_LIST CUDA_HOME 2>/dev/null || true
-          else
-            echo "[sage][warn] Failed to download SageAttention source; skipping (optional in modern ComfyUI)."
-          fi
-          rm -rf "${TMP_CLONE_DIR:-}"
-      fi
-  else
-      echo "[sage] Unsupported or unknown GPU architecture ($ARCH); skipping sageattention install (optional in modern ComfyUI)."
-  fi
-fi
+verify_sageattention_runtime "$VIRTUAL_ENV"
 
 # --- Optional first-boot restore (via ComfyUI_HuggingFace_Downloader's own backup.py API) ---
 find_hf_downloader_nodepack() {
@@ -3668,6 +3718,13 @@ export NIGHTLY_COMFYUI
 export DISABLE_SHUTDOWN_TIMER
 export RUNPOD_DISABLE_SHUTDOWN_TIMER
 export RUNPOD_TIMER_ENABLED
+export PIP_CONSTRAINT
+export PIP_BUILD_CONSTRAINT
+export UV_CONSTRAINT
+export UV_BUILD_CONSTRAINT
+export PIP_EXTRA_INDEX_URL
+export UV_EXTRA_INDEX_URL
+export LD_LIBRARY_PATH
 
 spawn_app_session() {
   local command_text="$1"
