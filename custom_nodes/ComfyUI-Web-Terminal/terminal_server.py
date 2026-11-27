@@ -28,6 +28,8 @@ ALLOWED_ASSETS = {
 }
 
 MAX_SCROLLBACK_BYTES = 256 * 1024
+MAX_EXEC_OUTPUT_BYTES = 256 * 1024
+EXEC_UNSET_ENV_VARS = ("API_KEY_COMFY_ORG", "RUNPOD_API_KEY")
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,48}$")
 RCFILE_PATH = "/tmp/comfy_web_terminal.bashrc"
 
@@ -108,6 +110,25 @@ def _build_pty_env() -> Dict[str, str]:
         parts = [p for p in env.get("PATH", "").split(":") if p and p != venv_bin]
         env["PATH"] = ":".join([venv_bin] + parts)
     return env
+
+
+def _build_exec_env() -> Dict[str, str]:
+    env = _build_pty_env()
+    env["TERM"] = "dumb"
+    env["NO_COLOR"] = "1"
+    env.pop("COLORTERM", None)
+    for key in EXEC_UNSET_ENV_VARS:
+        env.pop(key, None)
+    return env
+
+
+def _cap_exec_bytes(raw: bytes) -> str:
+    if len(raw) <= MAX_EXEC_OUTPUT_BYTES:
+        return raw.decode("utf-8", errors="replace")
+    half = MAX_EXEC_OUTPUT_BYTES // 2
+    head = raw[:half].decode("utf-8", errors="ignore")
+    tail = raw[-half:].decode("utf-8", errors="ignore")
+    return f"{head}\n...[truncated]...\n{tail}"
 
 
 def _sanitize_session_id(raw: Optional[str]) -> str:
@@ -710,6 +731,88 @@ async def _on_shutdown(_app: web.Application) -> None:
     manager.shutdown_all()
 
 
+async def api_terminal_exec(request: web.Request) -> web.Response:
+    """Run a non-interactive shell command without PTY overhead and return stdout/stderr/exitCode."""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "Invalid JSON body."}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"ok": False, "error": "Invalid payload."}, status=400)
+
+    command = body.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return web.json_response({"ok": False, "error": "Field 'command' is required."}, status=400)
+
+    cwd_raw = body.get("cwd")
+    cwd = cwd_raw.strip() if isinstance(cwd_raw, str) and cwd_raw.strip() else _detect_default_cwd()
+    if not os.path.isdir(cwd):
+        return web.json_response({"ok": False, "error": f"Working directory not found: {cwd}"}, status=400)
+
+    timeout_raw = body.get("timeout", 600.0)
+    try:
+        timeout_s = max(5.0, min(1800.0, float(timeout_raw)))
+    except (TypeError, ValueError):
+        timeout_s = 600.0
+
+    shell = "/bin/bash" if os.path.exists("/bin/bash") else "/bin/sh"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            shell,
+            "-c",
+            command,
+            cwd=cwd,
+            env=_build_exec_env(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        return web.json_response(
+            {"ok": False, "exitCode": 1, "cwd": cwd, "stdout": "", "stderr": "", "error": str(exc)},
+            status=500,
+        )
+
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        exit_code = int(proc.returncode or 0)
+        return web.json_response(
+            {
+                "ok": exit_code == 0,
+                "exitCode": exit_code,
+                "cwd": cwd,
+                "stdout": _cap_exec_bytes(stdout_bytes),
+                "stderr": _cap_exec_bytes(stderr_bytes),
+                "timedOut": False,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+    except asyncio.TimeoutError:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        except Exception:
+            stdout_bytes, stderr_bytes = b"", b""
+        return web.json_response(
+            {
+                "ok": False,
+                "exitCode": 124,
+                "cwd": cwd,
+                "stdout": _cap_exec_bytes(stdout_bytes),
+                "stderr": _cap_exec_bytes(stderr_bytes),
+                "timedOut": True,
+                "error": f"Command timed out after {int(timeout_s)}s.",
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+
 def setup(app: web.Application) -> None:
     _safe_add_route(app, "GET", "/ws/terminal", ws_terminal_handler)
     _safe_add_route(app, "GET", "/terminal", standalone_terminal_page)
@@ -717,5 +820,6 @@ def setup(app: web.Application) -> None:
     _safe_add_route(app, "GET", "/api/terminal/sessions", api_sessions_list)
     _safe_add_route(app, "POST", "/api/terminal/sessions/{session_id}/restart", api_session_restart)
     _safe_add_route(app, "DELETE", "/api/terminal/sessions/{session_id}", api_session_delete)
+    _safe_add_route(app, "POST", "/api/terminal/exec", api_terminal_exec)
     if _on_shutdown not in app.on_shutdown:
         app.on_shutdown.append(_on_shutdown)
